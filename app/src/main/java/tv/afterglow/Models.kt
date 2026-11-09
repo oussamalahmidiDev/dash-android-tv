@@ -74,7 +74,9 @@ internal data class Addon(
 }
 
 @Serializable
-internal data class Subtitle(val url: String, val language: String)
+internal data class Subtitle(
+    val url: String, val language: String, val label: String = "", val source: String = ""
+)
 
 @Serializable
 internal data class Source(
@@ -92,7 +94,8 @@ internal data class Shelf(val id: String, val name: String, val kind: Kind, val 
 @Serializable
 internal data class Resume(
     val title: Title, val episode: Episode?, val position: Long, val updated: Long,
-    val duration: Long? = null, val source: Source? = null
+    val duration: Long? = null, val source: Source? = null,
+    val subtitleUrl: String? = null, val subtitleLanguage: String? = null, val subtitleDelayMs: Long = 0L
 ) {
     val key get() = playbackKey(title, episode)
 }

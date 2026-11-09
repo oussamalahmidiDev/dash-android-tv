@@ -47,6 +47,18 @@ internal val DEFAULT_TRACKERS = listOf(
     "http://tracker.openbittorrent.com:80/announce"
 )
 
+internal const val OPENSUBTITLES_MANIFEST = "https://opensubtitles-v3.strem.io/manifest.json"
+
+internal val openSubtitlesDefault = Addon(
+    url = OPENSUBTITLES_MANIFEST,
+    name = "OpenSubtitles",
+    allowHttp = false,
+    types = listOf("movie", "series"),
+    prefixes = listOf("tt"),
+    resources = listOf(Resource("subtitles")),
+    catalogs = emptyList()
+)
+
 internal class Stremio {
     private fun read(url: HttpUrl, http: Boolean): Pair<HttpUrl, JsonObject> = Network.fetch(url, http) { response ->
         val body = response.body ?: throw FeedError("The add-on returned an empty response.")
@@ -161,6 +173,22 @@ internal class Stremio {
                 url?.toString(), magnet, item.number("fileIdx"), url?.let(::guessMime), subtitles,
                 addon.allowHttp, headers, description = item.str("description").ifBlank { item.str("title") })
         }.distinctBy { Triple(it.url, it.magnet, it.fileIndex) }
+    }
+
+    fun subtitles(addon: Addon, type: String, id: String): List<Subtitle> {
+        val (base, response) = read(endpoint(addon, "subtitles", type, id), addon.allowHttp)
+        return response.items("subtitles").mapNotNull { element ->
+            val item = element.obj() ?: return@mapNotNull null
+            val subUrl = item.str("url").takeIf(String::isNotBlank)?.let(base::resolve) ?: return@mapNotNull null
+            if (!subUrl.isHttps && !addon.allowHttp) return@mapNotNull null
+            val lang = item.str("lang").ifBlank { "und" }
+            val label = listOf(
+                item.str("subtitleFileName"),
+                item.str("movieReleaseName"),
+                item.str("releaseGroup").takeIf(String::isNotBlank)?.let { "[$it]" }
+            ).firstOrNull { !it.isNullOrBlank() } ?: "$lang subtitle"
+            Subtitle(subUrl.toString(), lang, label, addon.name)
+        }
     }
 
     private fun JsonObject.toTitle(kind: Kind, addon: Addon, base: HttpUrl): Title? {

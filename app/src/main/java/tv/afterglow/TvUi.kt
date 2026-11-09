@@ -3,6 +3,7 @@ package tv.afterglow
 import android.content.Context
 import android.media.AudioManager
 import android.os.Bundle
+import android.view.KeyEvent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -124,6 +125,25 @@ class MainActivity : ComponentActivity() {
                 ProvideTextStyle(InterTypography.bodyLarge.copy(letterSpacing = 0.sp)) { TvApp(model) }
             }
         }
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        when (keyCode) {
+            KeyEvent.KEYCODE_VOLUME_UP -> {
+                audioManager?.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_RAISE, AudioManager.FLAG_SHOW_UI)
+                return true
+            }
+            KeyEvent.KEYCODE_VOLUME_DOWN -> {
+                audioManager?.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_LOWER, AudioManager.FLAG_SHOW_UI)
+                return true
+            }
+            KeyEvent.KEYCODE_VOLUME_MUTE -> {
+                audioManager?.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_TOGGLE_MUTE, AudioManager.FLAG_SHOW_UI)
+                return true
+            }
+        }
+        return super.onKeyDown(keyCode, event)
     }
 }
 
@@ -362,9 +382,12 @@ private fun TvApp(model: AfterglowViewModel) {
             }
         }
         if (playback != null) {
+            val miniShape = RoundedCornerShape(12.dp)
             val frame = if (minimized) {
                 Modifier.align(Alignment.BottomEnd).padding(end = 24.dp, bottom = 22.dp)
                     .width((maxWidth * .31f).coerceIn(220.dp, 340.dp)).aspectRatio(16f / 9)
+                    .clip(miniShape)
+                    .border(1.dp, Color.White.copy(alpha = 0.20f), miniShape)
             } else Modifier.fillMaxSize()
             FocusScope(memory, "player/${playback.token}") {
                 PlaybackScreen(playback, frame, minimized, model::minimize, model::expandPlayer,

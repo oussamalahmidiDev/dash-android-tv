@@ -491,16 +491,19 @@ internal class AfterglowViewModel(application: Application) : AndroidViewModel(a
 
     fun expandPlayer() { playerMinimized = false }
 
-    var volume by mutableStateOf(100); private set
-
-    fun updateVolume(level: Int) {
-        volume = level.coerceIn(0, 100)
-    }
-
     fun switchPlayerSource(source: Source) {
         val current = playback ?: return
         rememberSource(current.title, current.episode, source)
         playback = current.copy(source = source)
+    }
+
+    suspend fun getSubtitles(title: Title, episode: Episode?): List<Subtitle> {
+        return library.fetchSubtitles(addons, title, episode)
+    }
+
+    fun getResume(title: Title, episode: Episode?): Resume? {
+        val key = playbackKey(title, episode)
+        return progress.firstOrNull { it.key == key }
     }
 
     fun exitPlayback() {
@@ -518,13 +521,21 @@ internal class AfterglowViewModel(application: Application) : AndroidViewModel(a
         }
     }
 
-    fun record(request: PlayRequest, position: Long, duration: Long, ended: Boolean) {
+    fun record(
+        request: PlayRequest, position: Long, duration: Long, ended: Boolean,
+        subtitleUrl: String? = null, subtitleLanguage: String? = null, subtitleDelayMs: Long? = null,
+        clearSubtitle: Boolean = false
+    ) {
         if (request.title.kind == Kind.LIVE || (!ended && position < 1_000L)) return
         val key = playbackKey(request.title, request.episode)
         val knownDuration = duration.takeIf { it > 0 } ?: progress.firstOrNull { it.key == key }?.duration
+        val prev = progress.firstOrNull { it.key == key }
         val item = if (ended) null else Resume(
             request.title, request.episode, position, System.currentTimeMillis(), knownDuration,
-            lastChosenSources[key] ?: request.source
+            lastChosenSources[key] ?: request.source,
+            subtitleUrl = if (clearSubtitle) null else (subtitleUrl ?: prev?.subtitleUrl),
+            subtitleLanguage = if (clearSubtitle) null else (subtitleLanguage ?: prev?.subtitleLanguage),
+            subtitleDelayMs = subtitleDelayMs ?: prev?.subtitleDelayMs ?: 0L
         )
         progress = listOfNotNull(item) + progress.filterNot { it.key == key }
         viewModelScope.launch {

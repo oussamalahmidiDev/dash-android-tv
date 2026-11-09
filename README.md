@@ -6,13 +6,13 @@ DASH is a native Android TV and Google TV app for Android 8.0 or later. It bring
 
 [Browse published DASH releases](https://github.com/oussamalahmidiDev/dash-android-tv/releases).
 
-**With a USB drive.** Copy `DASH-2.0.1.apk` to a USB drive. Open it from a file manager on the TV, allow that file manager to install apps if Android prompts you, and select **Install**. DASH appears in the TV app launcher.
+**With a USB drive.** Copy `DASH-2.0.4.apk` to a USB drive. Open it from a file manager on the TV, allow that file manager to install apps if Android prompts you, and select **Install**. DASH appears in the TV app launcher.
 
 **With ADB.** Enable debugging on the TV and connect it to your computer with the option your TV offers. For a TV with **Wireless debugging**, pair and connect using the addresses shown on the TV. The pairing and connection ports can be different. [Android Debug Bridge setup](https://developer.android.com/tools/adb)
 
 ```sh
 adb devices
-adb install -r DASH-2.0.1.apk
+adb install -r DASH-2.0.4.apk
 ```
 
 To upgrade from an earlier DASH or Afterglow version, install the signed DASH APK over the existing installation. The package ID and signing key carry over, so your playlists, add-ons, favorites, and playback progress stay in place.

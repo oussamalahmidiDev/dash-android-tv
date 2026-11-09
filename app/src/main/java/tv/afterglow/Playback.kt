@@ -3,22 +3,28 @@
 package tv.afterglow
 
 import android.annotation.SuppressLint
+import android.app.Activity
 import android.content.Context
+import android.content.ContextWrapper
 import android.net.Uri
 import android.util.Log
 import android.view.LayoutInflater
+import android.view.WindowManager
 import android.view.KeyEvent as AndroidKeyEvent
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.focusable
+import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -58,6 +64,7 @@ import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.TrackSelectionOverride
+import androidx.media3.common.TrackSelectionParameters
 import androidx.media3.common.Tracks
 import androidx.media3.common.VideoSize
 import androidx.media3.datasource.DataSource
@@ -65,8 +72,10 @@ import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.TransferListener
 import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.ui.PlayerView
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -77,6 +86,7 @@ import kotlinx.coroutines.job
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import okhttp3.Request
@@ -254,11 +264,10 @@ internal fun PlaybackScreen(
                     sources = model.playerSources,
                     loadingSources = model.loadingPlayerSources,
                     p2p = model.p2p,
-                    volume = model.volume,
-                    setVolume = model::updateVolume,
                     loadSources = { model.loadSourcesForPlayer(request.title, request.episode) },
                     onSwitchSource = model::switchPlayerSource,
-                    stop, onStarted, { position, duration, ended ->
+                    model = model,
+                    exit = stop, onStarted = onStarted, record = { position, duration, ended ->
                         if (request.title.kind != Kind.LIVE) {
                             resumePosition = if (ended) 0 else position
                             record(position, duration, ended)
@@ -337,8 +346,8 @@ private fun Video(
     prepared: Prepared, request: PlayRequest, activeSource: Source, initialPosition: Long, minimized: Boolean,
     minimize: () -> Unit, expand: () -> Unit,
     sources: List<Source>, loadingSources: Boolean, p2p: Boolean,
-    volume: Int, setVolume: (Int) -> Unit,
     loadSources: () -> Unit, onSwitchSource: (Source) -> Unit,
+    model: AfterglowViewModel,
     exit: () -> Unit, onStarted: () -> Unit,
     record: (Long, Long, Boolean) -> Unit, retry: () -> Unit
 ) {
@@ -348,10 +357,8 @@ private fun Video(
     val latestStarted by rememberUpdatedState(onStarted)
     val live = request.title.kind == Kind.LIVE
     val player = remember(prepared) {
-        makePlayer(context, prepared, initialPosition.takeUnless { live } ?: 0L,
-            volume, live || !minimized)
+        makePlayer(context, prepared, initialPosition.takeUnless { live } ?: 0L)
     }
-    LaunchedEffect(player, volume) { player.volume = volume / 100f }
     var videoSize by remember(player) { mutableStateOf(VideoSize.UNKNOWN) }
     val quality = when {
         videoSize.width >= 3700 || videoSize.height >= 2100 -> "4K"
@@ -372,15 +379,13 @@ private fun Video(
     var activity by remember { mutableIntStateOf(0) }
     var trackType by remember { mutableStateOf<Int?>(null) }
     var showSourcePicker by remember { mutableStateOf(false) }
-    var showVolume by remember { mutableStateOf(false) }
-    var resumeOnExpand by remember(player) { mutableStateOf(true) }
+    var showSubtitlePicker by remember { mutableStateOf(false) }
     var wasExpanded by remember(player) { mutableStateOf(!minimized) }
-    val volumeFocus = remember { FocusRequester() }
-    var restoreVolumeFocus by remember { mutableStateOf(false) }
     var ended by remember { mutableStateOf(false) }
     var hasPlayed by remember { mutableStateOf(false) }
     val hiddenFocus = remember { FocusRequester() }
     val timelineFocus = remember { FocusRequester() }
+    val playButtonFocus = remember { FocusRequester() }
     var timelineFocused by remember { mutableStateOf(false) }
     var focusTimeline by remember { mutableStateOf(false) }
     var seekPreview by remember(player) { mutableStateOf<Long?>(null) }
@@ -389,6 +394,118 @@ private fun Video(
     val audioFocus = remember { FocusRequester() }
     val subtitleFocus = remember { FocusRequester() }
     var returningToTrack by remember { mutableStateOf<Int?>(null) }
+
+    // Screen-saver suppression while playing video
+    val activityContext = context as? Activity ?: (context as? ContextWrapper)?.baseContext as? Activity
+    DisposableEffect(playing) {
+        if (playing) {
+            activityContext?.window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+        onDispose {
+            activityContext?.window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
+
+    // Subtitle management
+    var availableSubtitles by remember { mutableStateOf<List<Subtitle>>(emptyList()) }
+    var loadingSubtitles by remember { mutableStateOf(false) }
+    var selectedSubtitleUrl by remember { mutableStateOf<String?>(null) }
+    var activeCues by remember { mutableStateOf<List<SubtitleCue>>(emptyList()) }
+    var subtitleDelayMs by remember { mutableLongStateOf(0L) }
+
+    val embeddedSubtitleOptions = remember(tracks, player.trackSelectionParameters) {
+        val type = C.TRACK_TYPE_TEXT
+        tracks.groups.filter { it.type == type }.flatMap { group ->
+            (0 until group.length).filter { group.isTrackSupported(it) }.map { group to it }
+        }.mapIndexed { index, (group, track) ->
+            val format = group.getTrackFormat(track)
+            val lang = format.language?.takeUnless { it.isBlank() || it == "und" }?.let { normalizeLanguage(it) } ?: ""
+            val label = format.label?.takeIf(String::isNotBlank)
+                ?: lang.takeIf(String::isNotBlank)
+                ?: "Track ${index + 1}"
+            val override = TrackSelectionOverride(group.mediaTrackGroup, listOf(track))
+            val selected = group.isTrackSelected(track)
+            TrackOption(label, selected, override, language = lang, source = "Embedded")
+        }
+    }
+    val selectedEmbeddedTrack = embeddedSubtitleOptions.firstOrNull { it.selected }
+
+    val coroutineScope = rememberCoroutineScope()
+
+    fun selectExternalSubtitle(sub: Subtitle) {
+        selectedSubtitleUrl = sub.url
+        val selection = player.trackSelectionParameters.buildUpon()
+        selection.setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
+        player.trackSelectionParameters = selection.build()
+
+        coroutineScope.launch(Dispatchers.IO) {
+            try {
+                val req = Request.Builder().url(sub.url).header("User-Agent", "Mozilla/5.0").build()
+                Network.client(true).newCall(req).execute().use { resp ->
+                    if (resp.isSuccessful) {
+                        val text = resp.body?.string().orEmpty()
+                        if (text.isNotBlank()) {
+                            val parsed = parseSubtitles(text)
+                            withContext(Dispatchers.Main) {
+                                activeCues = parsed
+                            }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("AfterglowSubtitles", "Failed to download subtitle: ${e.message}")
+            }
+        }
+        model.record(request, position, duration, false, subtitleUrl = sub.url, subtitleLanguage = sub.language, subtitleDelayMs = subtitleDelayMs)
+    }
+
+    fun selectEmbeddedSubtitle(option: TrackOption) {
+        selectedSubtitleUrl = null
+        activeCues = emptyList()
+        val selection = player.trackSelectionParameters.buildUpon()
+        selection.clearOverridesOfType(C.TRACK_TYPE_TEXT)
+        selection.setTrackTypeDisabled(C.TRACK_TYPE_TEXT, option.override == null)
+        option.override?.let(selection::setOverrideForType)
+        player.trackSelectionParameters = selection.build()
+        model.record(request, position, duration, false, clearSubtitle = true, subtitleDelayMs = subtitleDelayMs)
+    }
+
+    fun disableSubtitles() {
+        selectedSubtitleUrl = null
+        activeCues = emptyList()
+        val selection = player.trackSelectionParameters.buildUpon()
+        selection.setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
+        player.trackSelectionParameters = selection.build()
+        model.record(request, position, duration, false, clearSubtitle = true, subtitleDelayMs = subtitleDelayMs)
+    }
+
+    fun adjustSubtitleDelay(delta: Long) {
+        subtitleDelayMs = if (delta == 0L) 0L else (subtitleDelayMs + delta).coerceIn(-30_000L, 30_000L)
+        model.record(request, position, duration, false, subtitleDelayMs = subtitleDelayMs)
+    }
+
+    LaunchedEffect(request.token) {
+        val resume = model.getResume(request.title, request.episode)
+        if (resume != null) {
+            subtitleDelayMs = resume.subtitleDelayMs
+            selectedSubtitleUrl = resume.subtitleUrl
+        }
+        loadingSubtitles = true
+        val fetched = withContext(Dispatchers.IO) {
+            model.getSubtitles(request.title, request.episode)
+        }
+        availableSubtitles = fetched
+        loadingSubtitles = false
+
+        val allAvailable = (activeSource.subtitles + fetched).distinctBy { it.url }
+        val rememberedUrl = resume?.subtitleUrl
+        if (!rememberedUrl.isNullOrBlank()) {
+            val matching = allAvailable.firstOrNull { it.url == rememberedUrl }
+            if (matching != null) {
+                selectExternalSubtitle(matching)
+            }
+        }
+    }
 
     fun showControls() { visible = true; activity++ }
     fun previewSeek(delta: Long) {
@@ -429,19 +546,6 @@ private fun Video(
         returningToTrack = type
         trackType = null
         showControls()
-    }
-
-    fun closeVolume() {
-        showVolume = false
-        restoreVolumeFocus = true
-        showControls()
-    }
-    LaunchedEffect(restoreVolumeFocus) {
-        if (restoreVolumeFocus) {
-            withFrameNanos { }
-            volumeFocus.tryFocus()
-            restoreVolumeFocus = false
-        }
     }
 
     DisposableEffect(player, lifecycle) {
@@ -487,7 +591,7 @@ private fun Video(
                 error = problem
                 trackType = null
                 showSourcePicker = false
-                showVolume = false
+                showSubtitlePicker = false
                 showControls()
             }
 
@@ -504,33 +608,29 @@ private fun Video(
         }
     }
 
-    LaunchedEffect(player) {
+    LaunchedEffect(player, minimized) {
         var lastSaved = 0L
         while (true) {
             position = player.currentPosition
             duration = player.duration
-            if (!live && playing && kotlin.math.abs(position - lastSaved) >= 4_000) {
+            if (!live && playing && kotlin.math.abs(position - lastSaved) >= 15_000L) {
                 latestRecord(position, duration, false)
                 lastSaved = position
             }
-            delay(400)
+            delay(if (minimized) 1_000L else 400L)
         }
     }
     LaunchedEffect(minimized) {
         trackType = null
         showSourcePicker = false
-        showVolume = false
-        if (minimized && !live) {
-            if (wasExpanded) resumeOnExpand = player.playWhenReady
-            player.pause()
-        } else if (!minimized) {
+        showSubtitlePicker = false
+        if (!minimized) {
             wasExpanded = true
-            if (!live && resumeOnExpand && !ended && error == null) player.play()
             showControls()
         }
     }
-    LaunchedEffect(minimized, visible, playing, activity, trackType, showSourcePicker, showVolume, error) {
-        if (!minimized && visible && playing && trackType == null && !showSourcePicker && !showVolume && error == null) {
+    LaunchedEffect(minimized, visible, playing, activity, trackType, showSourcePicker, showSubtitlePicker, error) {
+        if (!minimized && visible && playing && trackType == null && !showSourcePicker && !showSubtitlePicker && error == null) {
             delay(6_500)
             visible = false
         }
@@ -550,7 +650,7 @@ private fun Video(
     }
     BackHandler(!minimized) {
         when {
-            showVolume -> closeVolume()
+            showSubtitlePicker -> showSubtitlePicker = false
             showSourcePicker -> showSourcePicker = false
             trackType != null -> closeTrackPicker()
             error == null -> minimize()
@@ -582,7 +682,21 @@ private fun Video(
                     wasHidden
                 }
             }
-            AndroidKeyEvent.KEYCODE_DPAD_UP, AndroidKeyEvent.KEYCODE_DPAD_DOWN -> {
+            AndroidKeyEvent.KEYCODE_DPAD_UP -> {
+                if (visible && trackType == null && !showSourcePicker && !showSubtitlePicker && error == null) {
+                    if (timelineFocused) {
+                        visible = false
+                        timelineFocused = false
+                        focusTimeline = false
+                        hiddenFocus.requestFocus()
+                        return@onPreviewKeyEvent true
+                    }
+                }
+                val wasHidden = !visible
+                showControls()
+                wasHidden
+            }
+            AndroidKeyEvent.KEYCODE_DPAD_DOWN -> {
                 val wasHidden = !visible
                 showControls()
                 wasHidden
@@ -590,17 +704,51 @@ private fun Video(
             else -> false
         }
     }) {
-        key(minimized) {
-            AndroidView(factory = { ctx ->
-                val view = if (minimized) {
-                    // AndroidView supplies the parent and measures the video using its Compose bounds.
-                    LayoutInflater.from(ctx).inflate(R.layout.mini_player, null, false) as PlayerView
-                } else PlayerView(ctx)
-                view.apply {
-                    useController = false
-                    isFocusable = false
-                }
-            }, modifier = Modifier.fillMaxSize(), update = { it.player = player }, onRelease = { it.player = null })
+        AndroidView(factory = { ctx ->
+            PlayerView(ctx).apply {
+                useController = false
+                isFocusable = false
+                keepScreenOn = true
+            }
+        }, modifier = Modifier.fillMaxSize(), update = {
+            it.player = player
+            it.keepScreenOn = playing
+        }, onRelease = { it.player = null })
+
+        val currentMs = position
+        val activeSubtitleText = remember(currentMs, subtitleDelayMs, activeCues, minimized) {
+            if (activeCues.isEmpty() || minimized) null
+            else {
+                val target = currentMs - subtitleDelayMs
+                activeCues.firstOrNull { it.startMs <= target && target <= it.endMs }?.text
+            }
+        }
+
+        if (activeSubtitleText != null && !minimized) {
+            Box(
+                Modifier.fillMaxSize().padding(horizontal = 48.dp)
+                    .padding(bottom = if (visible) 116.dp else 44.dp),
+                contentAlignment = Alignment.BottomCenter
+            ) {
+                Text(
+                    text = activeSubtitleText,
+                    color = Color.White,
+                    fontSize = 22.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    lineHeight = 28.sp,
+                    textAlign = TextAlign.Center,
+                    style = MaterialTheme.typography.bodyLarge.copy(
+                        shadow = androidx.compose.ui.graphics.Shadow(
+                            color = Color.Black,
+                            offset = androidx.compose.ui.geometry.Offset(2f, 2f),
+                            blurRadius = 4f
+                        )
+                    ),
+                    modifier = Modifier
+                        .background(Color.Black.copy(alpha = 0.72f), RoundedCornerShape(8.dp))
+                        .padding(horizontal = 14.dp, vertical = 6.dp)
+                )
+            }
         }
 
         if (minimized) {
@@ -615,6 +763,13 @@ private fun Video(
                 Box(Modifier.align(Alignment.TopStart).padding(start = Rail, top = 27.dp)) {
                     IconAction(if (live) TvGlyph.CLOSE else TvGlyph.BACK,
                         if (live) "Stop channel" else "Back", "video/back",
+                        modifier = Modifier.onPreviewKeyEvent { key ->
+                            if (key.type == KeyEventType.KeyDown && key.nativeKeyEvent.keyCode == AndroidKeyEvent.KEYCODE_DPAD_UP) {
+                                visible = false
+                                hiddenFocus.requestFocus()
+                                true
+                            } else false
+                        },
                         onClick = if (live || activeError != null) exit else minimize)
                 }
                 Column(
@@ -634,16 +789,28 @@ private fun Video(
                     } else {
                         if (!live && duration > 0) {
                             val displayedPosition = seekPreview ?: position
-                            val timeline = if (canSeek) Modifier.focusRequester(timelineFocus)
+                            val timeline = if (canSeek) Modifier
+                                .focusRequester(timelineFocus)
                                 .onFocusChanged { timelineFocused = it.isFocused }
-                                .semantics { contentDescription = "Timeline. Press left or right to seek." }.focusable() else Modifier
+                                .focusProperties { down = playButtonFocus }
+                                .onPreviewKeyEvent { key ->
+                                    if (key.type == KeyEventType.KeyDown && key.nativeKeyEvent.keyCode == AndroidKeyEvent.KEYCODE_DPAD_UP) {
+                                        visible = false
+                                        timelineFocused = false
+                                        focusTimeline = false
+                                        hiddenFocus.requestFocus()
+                                        true
+                                    } else false
+                                }
+                                .semantics { contentDescription = "Timeline. Press left or right to seek." }
+                                .focusable() else Modifier
                             Row(timeline.heightIn(min = 28.dp), verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                                 Muted(time(displayedPosition), size = 12)
                                 Box(Modifier.weight(1f).height(if (timelineFocused) 7.dp else 4.dp)
                                     .background(Fog.copy(alpha = .36f), RoundedCornerShape(2.dp))) {
                                     Box(Modifier.fillMaxWidth((displayedPosition.toDouble() / duration).coerceIn(0.0, 1.0).toFloat())
-                                        .fillMaxHeight().background(if (timelineFocused) Glacier else Porcelain, RoundedCornerShape(2.dp)))
+                                        .fillMaxHeight().background(if (timelineFocused) Porcelain else Fog, RoundedCornerShape(2.dp)))
                                 }
                                 Muted(time(duration), size = 12)
                             }
@@ -672,7 +839,10 @@ private fun Video(
                                 }
                                 IconAction(if (shouldPause) TvGlyph.PAUSE else TvGlyph.PLAY,
                                     if (shouldPause) "Pause" else "Play", "video/play",
-                                    Modifier.focusProperties { if (canSeek) up = timelineFocus }, preferred = true,
+                                    Modifier
+                                        .focusRequester(playButtonFocus)
+                                        .focusProperties { if (canSeek) up = timelineFocus },
+                                    preferred = true,
                                     primary = true, onClick = ::toggle)
                                 if (!live) {
                                     IconAction(TvGlyph.FORWARD, "Ahead 30 seconds", "video/seek-forward") {
@@ -687,24 +857,24 @@ private fun Video(
                                 if (!live) {
                                     IconAction(TvGlyph.GRID, "Change source", "video/change-source", onClick = {
                                         trackType = null
+                                        showSubtitlePicker = false
                                         showSourcePicker = true
                                         loadSources()
                                     })
                                 }
                                 IconAction(TvGlyph.MINIMIZE, "Minimize player", "video/minimize", onClick = minimize)
-                                IconAction(TvGlyph.AUDIO, "Volume", "video/volume", Modifier.focusRequester(volumeFocus)) {
-                                    showVolume = true
-                                }
                                 if (tracks.groups.any { it.type == C.TRACK_TYPE_AUDIO }) {
                                     IconAction(TvGlyph.AUDIO_TRACKS, "Audio tracks", "video/audio", Modifier.focusRequester(audioFocus)) {
                                         showSourcePicker = false
+                                        showSubtitlePicker = false
                                         trackType = C.TRACK_TYPE_AUDIO
                                     }
                                 }
-                                if (tracks.groups.any { it.type == C.TRACK_TYPE_TEXT }) {
+                                if (!live || tracks.groups.any { it.type == C.TRACK_TYPE_TEXT }) {
                                     IconAction(TvGlyph.SUBTITLES, "Subtitles", "video/subtitles", Modifier.focusRequester(subtitleFocus)) {
                                         showSourcePicker = false
-                                        trackType = C.TRACK_TYPE_TEXT
+                                        trackType = null
+                                        showSubtitlePicker = true
                                     }
                                 }
                             }
@@ -713,14 +883,35 @@ private fun Video(
                 }
             }
         }
-        if (stage == Player.STATE_BUFFERING && activeError == null && trackType == null && !showSourcePicker && !showVolume) {
+        if (stage == Player.STATE_BUFFERING && activeError == null && trackType == null && !showSourcePicker && !showSubtitlePicker) {
             Loading(Modifier.align(Alignment.Center))
         }
-        if (showVolume) {
+        if (showSubtitlePicker) {
             Box(Modifier.align(Alignment.BottomEnd).padding(end = Rail, bottom = 111.dp)) {
-                Popup(alignment = Alignment.BottomEnd, onDismissRequest = ::closeVolume,
+                Popup(alignment = Alignment.BottomEnd, onDismissRequest = { showSubtitlePicker = false },
                     properties = PopupProperties(focusable = true)) {
-                    FocusScope(overlayMemory, "volume") { VolumeControl(volume, setVolume, ::closeVolume) }
+                    FocusScope(overlayMemory, "subtitles") {
+                        SubtitleFloatingPicker(
+                            availableSubtitles = (activeSource.subtitles + availableSubtitles).distinctBy { it.url },
+                            loading = loadingSubtitles,
+                            embeddedOptions = embeddedSubtitleOptions,
+                            selectedUrl = selectedSubtitleUrl,
+                            subtitleDelayMs = subtitleDelayMs,
+                            onSelectExternal = { sub ->
+                                selectExternalSubtitle(sub)
+                            },
+                            onSelectEmbedded = { track ->
+                                selectEmbeddedSubtitle(track)
+                            },
+                            onDisable = {
+                                disableSubtitles()
+                            },
+                            onAdjustDelay = { delta ->
+                                adjustSubtitleDelay(delta)
+                            },
+                            close = { showSubtitlePicker = false }
+                        )
+                    }
                 }
             }
         }
@@ -766,22 +957,393 @@ private fun Loading(modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun VolumeControl(volume: Int, setVolume: (Int) -> Unit, close: () -> Unit) {
-    Column(Modifier.width(256.dp).background(Slate, RoundedCornerShape(16.dp)).padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically) {
-            Heading("Volume", size = 20)
-            Muted("$volume%")
+private fun SubtitleFloatingPicker(
+    availableSubtitles: List<Subtitle>,
+    loading: Boolean,
+    embeddedOptions: List<TrackOption>,
+    selectedUrl: String?,
+    subtitleDelayMs: Long,
+    onSelectExternal: (Subtitle) -> Unit,
+    onSelectEmbedded: (TrackOption) -> Unit,
+    onDisable: () -> Unit,
+    onAdjustDelay: (Long) -> Unit,
+    close: () -> Unit
+) {
+    val shape = RoundedCornerShape(16.dp)
+    var selectedLanguage by remember { mutableStateOf("All") }
+    var selectedSource by remember { mutableStateOf("All") }
+
+    val closeRequester = remember { FocusRequester() }
+    val delayRequester = remember { FocusRequester() }
+    val langRequester = remember { FocusRequester() }
+    val srcRequester = remember { FocusRequester() }
+    val listRequester = remember { FocusRequester() }
+
+    val allLanguages = remember(availableSubtitles, embeddedOptions) {
+        val set = linkedSetOf("All", "English", "Français", "العربية")
+        availableSubtitles.forEach { set.add(normalizeLanguage(it.language)) }
+        embeddedOptions.forEach { if (it.language.isNotBlank()) set.add(it.language) }
+        set.take(5)
+    }
+
+    val allSources = remember(availableSubtitles, embeddedOptions) {
+        val set = linkedSetOf("All", "OpenSubtitles")
+        if (embeddedOptions.isNotEmpty()) set.add("Embedded")
+        availableSubtitles.forEach { sub ->
+            if (sub.source.isNotBlank()) set.add(sub.source)
         }
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            IconAction(TvGlyph.REMOVE, "Lower volume", "volume/down", preferred = true) {
-                setVolume((volume - 10).coerceAtLeast(0))
+        set.take(4)
+    }
+
+    val selectedEmbedded = embeddedOptions.firstOrNull { it.selected }
+    val isOffSelected = selectedUrl == null && (selectedEmbedded == null || !selectedEmbedded.selected)
+
+    val filteredEmbedded = remember(embeddedOptions, selectedLanguage, selectedSource) {
+        if (selectedSource != "All" && selectedSource != "Embedded") emptyList()
+        else {
+            embeddedOptions.filter { track ->
+                selectedLanguage == "All" || track.language.equals(selectedLanguage, ignoreCase = true)
             }
-            IconAction(TvGlyph.ADD, "Raise volume", "volume/up") {
-                setVolume((volume + 10).coerceAtMost(100))
+        }
+    }
+
+    val filteredExternal = remember(availableSubtitles, selectedLanguage, selectedSource) {
+        availableSubtitles.filter { sub ->
+            val srcMatch = when (selectedSource) {
+                "All" -> true
+                "OpenSubtitles" -> sub.source.isBlank() || sub.source.equals("OpenSubtitles", ignoreCase = true)
+                else -> sub.source.equals(selectedSource, ignoreCase = true)
             }
-            IconAction(TvGlyph.CLOSE, "Close volume", "volume/close", onClick = close)
+            val langMatch = selectedLanguage == "All" || normalizeLanguage(sub.language).equals(selectedLanguage, ignoreCase = true)
+            srcMatch && langMatch
+        }
+    }
+
+    val formattedDelay = when {
+        subtitleDelayMs > 0 -> "+%.1fs".format(subtitleDelayMs / 1000f)
+        subtitleDelayMs < 0 -> "-%.1fs".format(-subtitleDelayMs / 1000f)
+        else -> "0.0s"
+    }
+
+    Column(
+        Modifier.width(340.dp).background(Color(0xF214171C), shape)
+            .border(1.dp, Color.White.copy(alpha = 0.18f), shape).padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Row(
+            Modifier.fillMaxWidth().padding(start = 4.dp, bottom = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Heading("Subtitles", size = 16)
+            IconAction(
+                TvGlyph.CLOSE, "Close", "subtitles/close",
+                modifier = Modifier.focusRequester(closeRequester).focusProperties { down = delayRequester },
+                onClick = close
+            )
+        }
+
+        Column(
+            Modifier.fillMaxWidth().background(Color.White.copy(alpha = 0.05f), RoundedCornerShape(12.dp)).padding(8.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Timing Delay", color = Fog, fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                Text(formattedDelay, color = Porcelain, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+            }
+            Row(
+                Modifier.fillMaxWidth().focusGroup(),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                val delayActions = listOf(
+                    Triple("sub-delay-m500", "-0.5s", -500L),
+                    Triple("sub-delay-m100", "-0.1s", -100L),
+                    Triple("sub-delay-rst", "Reset", 0L),
+                    Triple("sub-delay-p100", "+0.1s", 100L),
+                    Triple("sub-delay-p500", "+0.5s", 500L)
+                )
+                delayActions.forEachIndexed { index, (id, label, delta) ->
+                    val mod = if (index == 0) {
+                        Modifier.focusRequester(delayRequester).focusProperties {
+                            up = closeRequester
+                            down = langRequester
+                        }
+                    } else {
+                        Modifier.focusProperties {
+                            up = closeRequester
+                            down = langRequester
+                        }
+                    }
+                    RemoteButton(
+                        id = id,
+                        modifier = mod,
+                        radius = 16,
+                        onClick = { onAdjustDelay(delta) }
+                    ) { focused ->
+                        Text(
+                            label,
+                            modifier = Modifier
+                                .background(if (focused) Porcelain else Slate, RoundedCornerShape(16.dp))
+                                .padding(horizontal = 7.dp, vertical = 5.dp),
+                            color = if (focused) Ink else Porcelain,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
+                }
+            }
+        }
+
+        Row(
+            Modifier.fillMaxWidth().focusGroup(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("Language: ", color = Fog, fontSize = 11.sp, modifier = Modifier.padding(end = 4.dp))
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                allLanguages.forEachIndexed { index, lang ->
+                    val isSelected = selectedLanguage == lang
+                    val mod = if (index == 0) {
+                        Modifier.focusRequester(langRequester).focusProperties {
+                            up = delayRequester
+                            down = srcRequester
+                        }
+                    } else {
+                        Modifier.focusProperties {
+                            up = delayRequester
+                            down = srcRequester
+                        }
+                    }
+                    RemoteButton(
+                        id = "sub-filter-lang-$lang",
+                        modifier = mod,
+                        radius = 20,
+                        onClick = { selectedLanguage = lang }
+                    ) { focused ->
+                        val bg = when {
+                            focused -> Porcelain
+                            isSelected -> Slate
+                            else -> Color.Transparent
+                        }
+                        val fg = if (focused) Ink else if (isSelected) Porcelain else Fog
+                        Text(
+                            lang,
+                            modifier = Modifier
+                                .background(bg, RoundedCornerShape(20.dp))
+                                .border(
+                                    width = 1.dp,
+                                    color = if (isSelected && !focused) Color.White.copy(alpha = 0.25f) else Color.Transparent,
+                                    shape = RoundedCornerShape(20.dp)
+                                )
+                                .padding(horizontal = 8.dp, vertical = 4.dp),
+                            color = fg,
+                            fontSize = 11.sp,
+                            fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal
+                        )
+                    }
+                }
+            }
+        }
+
+        Row(
+            Modifier.fillMaxWidth().focusGroup(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("Source: ", color = Fog, fontSize = 11.sp, modifier = Modifier.padding(end = 4.dp))
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                allSources.forEachIndexed { index, src ->
+                    val isSelected = selectedSource == src
+                    val mod = if (index == 0) {
+                        Modifier.focusRequester(srcRequester).focusProperties {
+                            up = langRequester
+                            down = listRequester
+                        }
+                    } else {
+                        Modifier.focusProperties {
+                            up = langRequester
+                            down = listRequester
+                        }
+                    }
+                    RemoteButton(
+                        id = "sub-filter-src-$src",
+                        modifier = mod,
+                        radius = 20,
+                        onClick = { selectedSource = src }
+                    ) { focused ->
+                        val bg = when {
+                            focused -> Porcelain
+                            isSelected -> Slate
+                            else -> Color.Transparent
+                        }
+                        val fg = if (focused) Ink else if (isSelected) Porcelain else Fog
+                        Text(
+                            src,
+                            modifier = Modifier
+                                .background(bg, RoundedCornerShape(20.dp))
+                                .border(
+                                    width = 1.dp,
+                                    color = if (isSelected && !focused) Color.White.copy(alpha = 0.25f) else Color.Transparent,
+                                    shape = RoundedCornerShape(20.dp)
+                                )
+                                .padding(horizontal = 8.dp, vertical = 4.dp),
+                            color = fg,
+                            fontSize = 11.sp,
+                            fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal
+                        )
+                    }
+                }
+            }
+        }
+
+        if (loading && availableSubtitles.isEmpty()) {
+            Row(
+                Modifier.padding(horizontal = 8.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                CircularProgressIndicator(Modifier.size(14.dp), color = Porcelain, strokeWidth = 2.dp)
+                Muted("Searching subtitles…", size = 12)
+            }
+        }
+
+        LazyColumn(
+            Modifier.heightIn(max = 220.dp),
+            state = rememberLazyListState(),
+            verticalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            item(key = "sub-item-off") {
+                RemoteButton(
+                    id = "sub-option-off",
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .focusRequester(listRequester)
+                        .focusProperties { up = srcRequester }
+                        .semantics {
+                            role = Role.RadioButton
+                            selected = isOffSelected
+                        },
+                    preferred = isOffSelected,
+                    radius = 8,
+                    onClick = {
+                        onDisable()
+                        close()
+                    }
+                ) { focused ->
+                    val tint = if (focused) Ink else Porcelain
+                    Row(
+                        Modifier.fillMaxWidth().background(if (focused) Porcelain else Color.Transparent)
+                            .padding(horizontal = 8.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Glyph(
+                            if (isOffSelected) TvGlyph.CHECK else TvGlyph.RADIO,
+                            if (isOffSelected && !focused) Porcelain else tint,
+                            Modifier.size(16.dp)
+                        )
+                        Text("Off", color = tint, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                    }
+                }
+            }
+
+            itemsIndexed(filteredEmbedded, key = { index, opt -> "embedded-$index-${opt.label}" }) { _, opt ->
+                val isSelected = selectedUrl == null && opt.selected
+                RemoteButton(
+                    id = "sub-embedded-${opt.label}",
+                    modifier = Modifier.fillMaxWidth().semantics {
+                        role = Role.RadioButton
+                        selected = isSelected
+                    },
+                    preferred = isSelected,
+                    radius = 8,
+                    onClick = {
+                        onSelectEmbedded(opt)
+                        close()
+                    }
+                ) { focused ->
+                    val tint = if (focused) Ink else Porcelain
+                    val mutedTint = if (focused) Ink.copy(alpha = 0.70f) else Fog
+                    Row(
+                        Modifier.fillMaxWidth().background(if (focused) Porcelain else Color.Transparent)
+                            .padding(horizontal = 8.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Glyph(
+                            if (isSelected) TvGlyph.CHECK else TvGlyph.RADIO,
+                            if (isSelected && !focused) Porcelain else tint,
+                            Modifier.size(16.dp)
+                        )
+                        Column(Modifier.weight(1f)) {
+                            Text(opt.label, color = tint, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text("Embedded", color = mutedTint, fontSize = 11.sp)
+                        }
+                    }
+                }
+            }
+
+            itemsIndexed(filteredExternal, key = { index, sub -> "external-$index-${sub.url}" }) { _, sub ->
+                val isSelected = selectedUrl == sub.url
+                val srcLabel = sub.source.ifBlank { "OpenSubtitles" }
+                val langLabel = normalizeLanguage(sub.language)
+                RemoteButton(
+                    id = "sub-ext-${sub.url}",
+                    modifier = Modifier.fillMaxWidth().semantics {
+                        role = Role.RadioButton
+                        selected = isSelected
+                    },
+                    preferred = isSelected,
+                    radius = 8,
+                    onClick = {
+                        onSelectExternal(sub)
+                        close()
+                    }
+                ) { focused ->
+                    val tint = if (focused) Ink else Porcelain
+                    val mutedTint = if (focused) Ink.copy(alpha = 0.70f) else Fog
+                    Row(
+                        Modifier.fillMaxWidth().background(if (focused) Porcelain else Color.Transparent)
+                            .padding(horizontal = 8.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Glyph(
+                            if (isSelected) TvGlyph.CHECK else TvGlyph.RADIO,
+                            if (isSelected && !focused) Porcelain else tint,
+                            Modifier.size(16.dp)
+                        )
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                sub.label.ifBlank { "$langLabel subtitle" },
+                                color = tint, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
+                                maxLines = 1, overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                "$langLabel · $srcLabel",
+                                color = mutedTint, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+                }
+            }
+
+            if (filteredEmbedded.isEmpty() && filteredExternal.isEmpty()) {
+                item(key = "sub-empty") {
+                    Muted("No subtitles found for this filter.", Modifier.padding(horizontal = 8.dp, vertical = 6.dp), size = 12)
+                }
+            }
         }
     }
 }
@@ -813,22 +1375,39 @@ private fun BoxScope.MiniPlayerControls(title: String, failed: Boolean, expand: 
     }
 }
 
-private fun makePlayer(context: Context, media: Prepared, position: Long, volume: Int, autoplay: Boolean): ExoPlayer {
+private fun makePlayer(context: Context, media: Prepared, position: Long): ExoPlayer {
     val loadControl = DefaultLoadControl.Builder()
         .setBufferDurationsMs(
             /* minBufferMs = */ 15_000,
             /* maxBufferMs = */ 50_000,
-            /* bufferForPlaybackMs = */ 500,
+            /* bufferForPlaybackMs = */ 1_000,
             /* bufferForPlaybackAfterRebufferMs = */ 2_000
         )
         .setPrioritizeTimeOverSizeThresholds(true)
         .setBackBuffer(10_000, false)
         .build()
-    val player = ExoPlayer.Builder(context)
+
+    val trackSelector = DefaultTrackSelector(context).apply {
+        parameters = buildUponParameters()
+            .setConstrainAudioChannelCountToDeviceCapabilities(true)
+            .setAudioOffloadPreferences(
+                TrackSelectionParameters.AudioOffloadPreferences.Builder()
+                    .setAudioOffloadMode(TrackSelectionParameters.AudioOffloadPreferences.AUDIO_OFFLOAD_MODE_DISABLED)
+                    .build()
+            )
+            .build()
+    }
+
+    val renderersFactory = DefaultRenderersFactory(context)
+        .setEnableAudioTrackPlaybackParams(true)
+
+    val player = ExoPlayer.Builder(context, renderersFactory)
+        .setTrackSelector(trackSelector)
         .setLoadControl(loadControl)
         .setSeekBackIncrementMs(10_000)
         .setSeekForwardIncrementMs(30_000)
         .build()
+
     val audioAttributes = AudioAttributes.Builder()
         .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
         .setUsage(C.USAGE_MEDIA)
@@ -836,14 +1415,14 @@ private fun makePlayer(context: Context, media: Prepared, position: Long, volume
     player.setAudioAttributes(audioAttributes, true)
     val factory = DefaultMediaSourceFactory(media.factory)
     player.setMediaSource(factory.createMediaSource(media.item), position)
-    player.volume = volume / 100f
-    player.playWhenReady = autoplay
+    player.playWhenReady = true
     player.prepare()
     return player
 }
 
 private data class TrackOption(
-    val label: String, val selected: Boolean, val override: TrackSelectionOverride? = null
+    val label: String, val selected: Boolean, val override: TrackSelectionOverride? = null,
+    val language: String = "", val source: String = "Embedded"
 )
 
 @Composable
@@ -899,7 +1478,7 @@ private fun TrackPicker(player: Player, tracks: Tracks, type: Int, close: () -> 
                     ) {
                         val tint = if (focused) Ink else Porcelain
                         Glyph(if (option.selected) TvGlyph.CHECK else TvGlyph.RADIO,
-                            if (option.selected && !focused) Glacier else tint, Modifier.size(17.dp))
+                            if (option.selected && !focused) Porcelain else tint, Modifier.size(17.dp))
                         Text(option.label, color = tint, fontSize = 13.sp, fontWeight = FontWeight.Medium,
                             maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
@@ -937,7 +1516,7 @@ private fun SourceFloatingPicker(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                CircularProgressIndicator(Modifier.size(16.dp), color = Glacier, strokeWidth = 2.dp)
+                CircularProgressIndicator(Modifier.size(16.dp), color = Porcelain, strokeWidth = 2.dp)
                 Muted("Finding sources…", size = 13)
             }
         } else if (sources.isEmpty()) {
@@ -971,7 +1550,7 @@ private fun SourceFloatingPicker(
                         ) {
                             Glyph(
                                 if (isSelected) TvGlyph.CHECK else TvGlyph.RADIO,
-                                if (isSelected && !focused) Glacier else tint,
+                                if (isSelected && !focused) Porcelain else tint,
                                 Modifier.size(16.dp)
                             )
                             Column(Modifier.weight(1f)) {
@@ -1006,4 +1585,79 @@ private fun time(millis: Long): String {
     val minutes = total / 60 % 60
     val seconds = total % 60
     return if (hours > 0) "%d:%02d:%02d".format(hours, minutes, seconds) else "%d:%02d".format(minutes, seconds)
+}
+
+data class SubtitleCue(
+    val startMs: Long,
+    val endMs: Long,
+    val text: String
+)
+
+private val timestampRegex = Regex("""(?:(\d{1,3}):)?(\d{2}):(\d{2})[,.](\d{2,3})\s*-->\s*(?:(\d{1,3}):)?(\d{2}):(\d{2})[,.](\d{2,3})""")
+private val htmlTagRegex = Regex("""<[^>]*>""")
+
+private fun parseTimestamp(hours: String?, minutes: String, seconds: String, millis: String): Long {
+    val h = hours?.toLongOrNull() ?: 0L
+    val m = minutes.toLongOrNull() ?: 0L
+    val s = seconds.toLongOrNull() ?: 0L
+    val rawMs = millis.toLongOrNull() ?: 0L
+    val ms = if (millis.length == 2) rawMs * 10L else rawMs
+    return h * 3600000L + m * 60000L + s * 1000L + ms
+}
+
+internal fun parseSubtitles(content: String): List<SubtitleCue> {
+    val cleanContent = content.removePrefix("\uFEFF").replace("\r\n", "\n").replace('\r', '\n')
+    val lines = cleanContent.split('\n')
+    val cues = mutableListOf<SubtitleCue>()
+    var i = 0
+    while (i < lines.size) {
+        val line = lines[i].trim()
+        val match = timestampRegex.find(line)
+        if (match != null) {
+            val startMs = parseTimestamp(match.groupValues[1].takeIf(String::isNotBlank), match.groupValues[2], match.groupValues[3], match.groupValues[4])
+            val endMs = parseTimestamp(match.groupValues[5].takeIf(String::isNotBlank), match.groupValues[6], match.groupValues[7], match.groupValues[8])
+            i++
+            val textLines = mutableListOf<String>()
+            while (i < lines.size && lines[i].isNotBlank() && !timestampRegex.containsMatchIn(lines[i])) {
+                val cleanLine = htmlTagRegex.replace(lines[i], "")
+                    .replace("&nbsp;", " ")
+                    .replace("&quot;", "\"")
+                    .replace("&apos;", "'")
+                    .replace("&lt;", "<")
+                    .replace("&gt;", ">")
+                    .replace("&amp;", "&")
+                    .trim()
+                if (cleanLine.isNotBlank()) {
+                    textLines.add(cleanLine)
+                }
+                i++
+            }
+            if (textLines.isNotEmpty() && endMs > startMs) {
+                cues.add(SubtitleCue(startMs, endMs, textLines.joinToString("\n")))
+            }
+        } else {
+            i++
+        }
+    }
+    return cues
+}
+
+internal fun normalizeLanguage(code: String): String {
+    val clean = code.trim().lowercase(Locale.ROOT)
+    return when {
+        clean == "en" || clean == "eng" || clean.startsWith("en-") || clean == "english" -> "English"
+        clean == "fr" || clean == "fre" || clean == "fra" || clean.startsWith("fr-") || clean == "french" || clean == "français" -> "Français"
+        clean == "ar" || clean == "ara" || clean.startsWith("ar-") || clean == "arabic" || clean == "العربية" -> "العربية"
+        clean == "es" || clean == "spa" || clean == "spanish" || clean == "español" -> "Español"
+        clean == "de" || clean == "ger" || clean == "deu" || clean == "german" || clean == "deutsch" -> "Deutsch"
+        clean == "it" || clean == "ita" || clean == "italian" || clean == "italiano" -> "Italiano"
+        clean == "pt" || clean == "por" || clean == "portuguese" -> "Português"
+        clean == "ru" || clean == "rus" || clean == "russian" -> "Русский"
+        else -> try {
+            val loc = Locale.forLanguageTag(clean)
+            loc.displayLanguage.takeIf(String::isNotBlank)?.replaceFirstChar { it.uppercase() } ?: code
+        } catch (_: Exception) {
+            code.replaceFirstChar { it.uppercase() }
+        }
+    }
 }

@@ -199,6 +199,20 @@ internal class Library(context: Context) {
         responses.filterNotNull().flatten()
     }
 
+    suspend fun fetchSubtitles(
+        addons: List<Addon>, title: Title, episode: Episode?
+    ): List<Subtitle> = io {
+        if (title.iptv) return@io emptyList()
+        val id = episode?.id ?: title.id
+        val type = title.kind.stremioType()
+        val allAddons = (addons + openSubtitlesDefault).distinctBy(Addon::url)
+        val matches = allAddons.filter { it.supports("subtitles", type, id) }
+        val responses = parallel(matches) { addon ->
+            attempt { stremio.subtitles(addon, type, id) }
+        }
+        responses.filterNotNull().flatten().distinctBy { it.url }
+    }
+
     suspend fun favorite(title: Title, added: Boolean) = io {
         store.change("favorite/${digest(title.key)}" to if (added) json.encodeToString(title) else null)
     }
