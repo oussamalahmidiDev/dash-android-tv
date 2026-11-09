@@ -1,6 +1,7 @@
 package tv.afterglow
 
 import android.content.Context
+import android.media.AudioManager
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -107,6 +108,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        volumeControlStream = AudioManager.STREAM_MUSIC
         WindowCompat.setDecorFitsSystemWindows(window, false)
         val insets = WindowCompat.getInsetsController(window, window.decorView)
         insets.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
@@ -276,7 +278,7 @@ private fun TvApp(model: AfterglowViewModel) {
     val playback = model.playback
     val detail = model.details
     val sourceSetup = model.sourceSetup
-    val minimized = playback != null && model.liveMinimized
+    val minimized = playback != null && model.playerMinimized
     val browseShelves = remember(model.shelves, model.local) { browseShelves(model.shelves, model.local.titles) }
     val catalog = browseShelves.firstOrNull { it.id == model.catalog }
     val resumeCatalog = Kind.entries.firstOrNull { continueCatalog(it) == model.catalog }
@@ -284,9 +286,8 @@ private fun TvApp(model: AfterglowViewModel) {
     BoxWithConstraints(Modifier.fillMaxSize()) {
         if (playback == null || minimized) {
             when {
-                !model.ready -> Box(Modifier.fillMaxSize().background(Ink), contentAlignment = Alignment.Center) {
-                    Muted("Opening DASH…")
-                }
+                !model.ready -> DashSplash()
+                model.needsSetup -> FocusScope(memory, "setup") { WelcomeSetup(model) }
                 sourceSetup != null -> {
                     BackHandler(onBack = model::closeSourceSetup)
                     FocusScope(memory, "source-setup/$sourceSetup") {
@@ -297,9 +298,9 @@ private fun TvApp(model: AfterglowViewModel) {
                     BackHandler(onBack = model::backFromDetails)
                     val stage = when {
                         !detail.showSources -> "overview"
+                        detail.sources.isNotEmpty() -> "sources"
                         detail.findingSources -> "finding"
-                        detail.sources.isEmpty() -> "empty"
-                        else -> "sources"
+                        else -> "empty"
                     }
                     val episodeKey = detail.episode?.id.orEmpty().takeIf { detail.showSources }.orEmpty()
                     val scope = "detail/${detail.title.key}/$episodeKey/$stage"
@@ -349,7 +350,7 @@ private fun TvApp(model: AfterglowViewModel) {
                                     }
                                 }
                                 CompositionLocalProvider(LocalFocusArea provides null) {
-                                    Navigation(model, Modifier.align(Alignment.TopCenter), if (minimized) model::expandLive else null) { tab ->
+                                    Navigation(model, Modifier.align(Alignment.TopCenter), if (minimized) model::expandPlayer else null) { tab ->
                                         if (model.tab != tab) model.go(tab)
                                         enterTabContent = true
                                     }
@@ -366,8 +367,9 @@ private fun TvApp(model: AfterglowViewModel) {
                     .width((maxWidth * .31f).coerceIn(220.dp, 340.dp)).aspectRatio(16f / 9)
             } else Modifier.fillMaxSize()
             FocusScope(memory, "player/${playback.token}") {
-                PlaybackScreen(playback, frame, minimized, model::minimizeLive, model::expandLive,
-                    onExit = model::exitPlayback, onStarted = { model.markChannelWatched(playback) }) { position, duration, ended ->
+                PlaybackScreen(playback, frame, minimized, model::minimize, model::expandPlayer,
+                    model, onExit = model::exitPlayback,
+                    onStarted = { model.markChannelWatched(playback) }) { position, duration, ended ->
                     model.record(playback, position, duration, ended)
                 }
             }
@@ -387,7 +389,7 @@ internal fun Modifier.onRemoteDown(action: () -> Boolean): Modifier = onPreviewK
 
 @Composable
 private fun Navigation(
-    model: AfterglowViewModel, modifier: Modifier, expandLive: (() -> Unit)?, enter: (Tab) -> Unit
+    model: AfterglowViewModel, modifier: Modifier, expandPlayer: (() -> Unit)?, enter: (Tab) -> Unit
 ) {
     Row(modifier.fillMaxWidth()
         .background(Brush.verticalGradient(listOf(BrowseBackground, BrowseBackground.copy(alpha = .95f), Color.Transparent)))
@@ -413,8 +415,8 @@ private fun Navigation(
                 }
             }
         }
-        if (expandLive != null) {
-            IconAction(TvGlyph.EXPAND, "Return to live playback", "nav/live-player", onClick = expandLive)
+        if (expandPlayer != null) {
+            IconAction(TvGlyph.EXPAND, "Return to playback", "nav/live-player", onClick = expandPlayer)
         }
     }
 }
@@ -447,7 +449,7 @@ internal fun EmptyPanel(title: String, note: String, action: String, click: () -
 
 @Composable
 internal fun CatalogScreen(shelf: Shelf, model: AfterglowViewModel) {
-    LazyColumn(Modifier.fillMaxSize().background(Ink), contentPadding = PaddingValues(Rail, 25.dp),
+    LazyColumn(Modifier.fillMaxSize().background(Ink), contentPadding = PaddingValues(start = Rail, top = 25.dp, end = Rail, bottom = 56.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item { IconAction(TvGlyph.BACK, "Back", "catalog/back", preferred = true) { model.openCatalog(null) } }
         item { Heading(shelf.name, size = 38) }

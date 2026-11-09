@@ -10,13 +10,20 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import kotlinx.coroutines.launch
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
@@ -71,12 +78,27 @@ internal fun BrowseScreen(model: AfterglowViewModel, shelves: List<Shelf>, kind:
         val portraitWidth = (maxWidth * .140f).coerceAtLeast(98.dp)
         val gap = (maxWidth * .020f).coerceAtLeast(12.dp)
         val stageHeight = (maxHeight * .80f).coerceAtLeast(310.dp)
+        val listState = rememberLazyListState()
+        val coroutineScope = rememberCoroutineScope()
+        var carouselHasFocus by remember { mutableStateOf(false) }
         SpotlightColumn(
-            contentPadding = PaddingValues(top = if (featured.isEmpty()) 74.dp else 0.dp, bottom = 40.dp),
-            topInset = 66.dp
+            state = listState,
+            contentPadding = PaddingValues(top = if (featured.isEmpty()) 74.dp else 0.dp, bottom = 56.dp),
+            topInset = 66.dp,
+            bottomInset = 56.dp
         ) {
             if (featured.isNotEmpty()) item("featured") {
-                FeaturedCarousel(model, featured, stageHeight)
+                Box(Modifier.onFocusChanged { state ->
+                    val isFocused = state.hasFocus
+                    if (isFocused && (!carouselHasFocus || listState.firstVisibleItemScrollOffset > 0 || listState.firstVisibleItemIndex > 0)) {
+                        coroutineScope.launch {
+                            listState.animateScrollToItem(0, 0)
+                        }
+                    }
+                    carouselHasFocus = isFocused
+                }) {
+                    FeaturedCarousel(model, featured, stageHeight)
+                }
                 Spacer(Modifier.height(13.dp))
             }
             if (progress.isNotEmpty()) item("continue") {
@@ -88,12 +110,22 @@ internal fun BrowseScreen(model: AfterglowViewModel, shelves: List<Shelf>, kind:
                     }
                 }
             }
+            if (favorites.isNotEmpty()) item("favorites") {
+                BrowseShelf("Favorites", "favorites") {
+                    ShelfStrip(gap) {
+                        itemsIndexed(favorites, key = { _, title -> title.key }) { index, title ->
+                            PortraitCard(title, "favorites/${title.key}", portraitWidth, null,
+                                featured.isEmpty() && progress.isEmpty() && index == 0) { model.open(title) }
+                        }
+                    }
+                }
+            }
             if (recent.isNotEmpty()) item("recent-channels") {
                 BrowseShelf("Recently Watched Channels", "recent-channels", icon = TvGlyph.CLOCK) {
                     ShelfStrip(gap) {
                         itemsIndexed(recent, key = { _, channel -> channel.key }) { index, channel ->
                             ChannelCard(channel, "recent/${channel.key}", landscapeWidth * .86f,
-                                preferred = featured.isEmpty() && progress.isEmpty() && index == 0) { model.open(channel) }
+                                preferred = featured.isEmpty() && progress.isEmpty() && favorites.isEmpty() && index == 0) { model.open(channel) }
                         }
                     }
                 }
@@ -105,18 +137,8 @@ internal fun BrowseScreen(model: AfterglowViewModel, shelves: List<Shelf>, kind:
                         itemsIndexed(shelf.titles.take(24), key = { _, title -> title.key }) { index, title ->
                             PortraitCard(title, "${shelf.id}/${title.key}", portraitWidth,
                                 if (ranked) index + 1 else null,
-                                featured.isEmpty() && progress.isEmpty() && recent.isEmpty() && shelfIndex == 0 && index == 0
+                                featured.isEmpty() && progress.isEmpty() && favorites.isEmpty() && recent.isEmpty() && shelfIndex == 0 && index == 0
                             ) { model.open(title) }
-                        }
-                    }
-                }
-            }
-            if (favorites.isNotEmpty()) item("favorites") {
-                BrowseShelf("Favorites", "favorites") {
-                    ShelfStrip(gap) {
-                        itemsIndexed(favorites, key = { _, title -> title.key }) { index, title ->
-                            PortraitCard(title, "favorites/${title.key}", portraitWidth, null,
-                                progress.isEmpty() && recent.isEmpty() && available.isEmpty() && index == 0) { model.open(title) }
                         }
                     }
                 }
@@ -142,17 +164,10 @@ internal fun BrowseShelf(
     cards: @Composable () -> Unit
 ) {
     Column(Modifier.padding(bottom = 29.dp)) {
-        if (onOpen == null) Row(Modifier.padding(start = BrowseRail, bottom = 9.dp),
+        Row(Modifier.padding(start = BrowseRail, bottom = 9.dp),
             verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             icon?.let { Glyph(it, Fog, Modifier.size(18.dp)) }
             Heading(name, size = 19)
-        } else RemoteButton("shelf-heading/$id", Modifier.padding(start = BrowseRail - 4.dp, bottom = 8.dp),
-            radius = 12, onClick = onOpen) {
-            Row(Modifier.padding(horizontal = 4.dp, vertical = 2.dp), verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                Heading(name, size = 19)
-                Glyph(TvGlyph.NEXT, Color.White.copy(alpha = .55f), Modifier.size(17.dp))
-            }
         }
         cards()
     }
@@ -282,7 +297,8 @@ private fun Modifier.favoriteState(favorite: FavoriteAction?): Modifier =
 @Composable
 internal fun ContinueScreen(progress: List<Resume>, model: AfterglowViewModel) {
     LazyColumn(Modifier.fillMaxSize().background(BrowseBackground),
-        contentPadding = PaddingValues(BrowseRail, 25.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        contentPadding = PaddingValues(start = BrowseRail, top = 25.dp, end = BrowseRail, bottom = 56.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item { IconAction(TvGlyph.BACK, "Back", "continue/back", preferred = true) { model.openCatalog(null) } }
         item { Heading("Continue Watching", size = 30) }
         itemsIndexed(progress, key = { _, resume -> resume.key }) { _, resume ->

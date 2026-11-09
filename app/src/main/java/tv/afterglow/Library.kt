@@ -34,6 +34,16 @@ internal class Library(context: Context) {
 
     private suspend fun <T> io(action: suspend () -> T): T = withContext(Dispatchers.IO) { action() }
 
+    suspend fun needsSetup(): Boolean = io {
+        val completed = store.load<Boolean>("setup-completed")
+        if (completed != null) return@io !completed
+        val existingInstall = store.load<Boolean>("cinemeta-default-added") == true
+        store.change("setup-completed" to json.encodeToString(existingInstall))
+        !existingInstall
+    }
+
+    suspend fun completeSetup() = io { store.change("setup-completed" to json.encodeToString(true)) }
+
     suspend fun restore(): SavedLibrary = io {
         val local = LocalLibrary(store.load("playlist"), store.load("entries") ?: emptyList(),
             store.load("guide") ?: emptyList())
@@ -164,16 +174,25 @@ internal class Library(context: Context) {
         )
     }
 
-    suspend fun sources(addons: List<Addon>, local: LocalLibrary, title: Title, episode: Episode?): List<Source> = io {
+    suspend fun sources(
+        addons: List<Addon>, local: LocalLibrary, title: Title, episode: Episode?,
+        onBatch: (suspend (List<Source>) -> Unit)? = null
+    ): List<Source> = io {
         val id = episode?.id ?: title.id
         if (title.iptv) {
             val entry = local.entryIndex[id.removePrefix("iptv:")] ?: return@io emptyList()
-            return@io listOf(Source("IPTV", entry.title, url = entry.url, mime = entry.mime,
+            val sources = listOf(Source("IPTV", entry.title, url = entry.url, mime = entry.mime,
                 allowHttp = local.playlist?.allowHttp == true))
+            onBatch?.invoke(sources)
+            return@io sources
         }
         val type = title.kind.stremioType()
         val matches = addons.filter { it.supports("stream", type, id) }
-        val responses = parallel(matches) { addon -> attempt { stremio.streams(addon, type, id) } }
+        val responses = parallel(matches) { addon ->
+            val streams = attempt { stremio.streams(addon, type, id) }
+            if (!streams.isNullOrEmpty()) onBatch?.invoke(streams)
+            streams
+        }
         if (responses.isNotEmpty() && responses.all { it == null }) {
             throw FeedError("The add-ons couldn’t load streams. Try again.")
         }
@@ -194,7 +213,7 @@ internal class Library(context: Context) {
 
     suspend fun p2p(enabled: Boolean) = io { store.change("p2p" to json.encodeToString(enabled)) }
 
-    private suspend fun <T, R> parallel(values: List<T>, action: (T) -> R): List<R> =
+    private suspend fun <T, R> parallel(values: List<T>, action: suspend (T) -> R): List<R> =
         coroutineScope { values.map { value -> async { slots.withPermit { action(value) } } }.awaitAll() }
 }
 

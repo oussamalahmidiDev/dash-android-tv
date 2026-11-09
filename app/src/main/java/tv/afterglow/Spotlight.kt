@@ -7,6 +7,8 @@ import androidx.compose.foundation.gestures.LocalBringIntoViewSpec
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
@@ -30,24 +32,30 @@ import androidx.compose.ui.unit.sp
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 internal fun SpotlightColumn(
-    contentPadding: PaddingValues, topInset: Dp = 0.dp, content: LazyListScope.() -> Unit
+    contentPadding: PaddingValues,
+    topInset: Dp = 0.dp,
+    bottomInset: Dp = 56.dp,
+    state: LazyListState = rememberLazyListState(),
+    content: LazyListScope.() -> Unit
 ) {
-    val inset = with(LocalDensity.current) { topInset.toPx() }
-    val keepVisible = remember(inset) {
+    val top = with(LocalDensity.current) { topInset.toPx() }
+    val bottom = with(LocalDensity.current) { bottomInset.toPx() }
+    val keepVisible = remember(top, bottom) {
         object : BringIntoViewSpec {
             override fun calculateScrollDistance(offset: Float, size: Float, containerSize: Float): Float {
                 val end = offset + size
+                val bottomLimit = containerSize - bottom
                 return when {
-                    offset < inset && end > containerSize -> 0f
-                    offset < inset -> offset - inset
-                    end > containerSize -> end - containerSize
+                    offset < top && end > bottomLimit -> 0f
+                    offset < top -> offset - top
+                    end > bottomLimit -> end - bottomLimit
                     else -> 0f
                 }
             }
         }
     }
     CompositionLocalProvider(LocalBringIntoViewSpec provides keepVisible) {
-        LazyColumn(contentPadding = contentPadding, content = content)
+        LazyColumn(state = state, contentPadding = contentPadding, content = content)
     }
 }
 

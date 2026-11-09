@@ -36,6 +36,17 @@ internal val cinemetaDefault = Addon(
     )
 )
 
+internal val DEFAULT_TRACKERS = listOf(
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.stealth.si:80/announce",
+    "udp://tracker.torrent.eu.org:451/announce",
+    "udp://tracker.openbittorrent.com:6969/announce",
+    "udp://open.tracker.cl:1337/announce",
+    "udp://opentracker.i2p.rocks:6969/announce",
+    "udp://explodie.org:6969/announce",
+    "http://tracker.openbittorrent.com:80/announce"
+)
+
 internal class Stremio {
     private fun read(url: HttpUrl, http: Boolean): Pair<HttpUrl, JsonObject> = Network.fetch(url, http) { response ->
         val body = response.body ?: throw FeedError("The add-on returned an empty response.")
@@ -111,14 +122,27 @@ internal class Stremio {
             val url = rawUrl.takeIf(String::isNotBlank)?.httpUrl()
             val hash = item.str("infoHash").takeIf { it.matches(Regex("[0-9a-fA-F]{40}")) }
             val hashMagnet = hash?.let { value ->
+                val existingTrackers = item.strings("sources").filter { it.startsWith("tracker:") }
+                    .map { it.removePrefix("tracker:") }
+                val trackers = (existingTrackers + DEFAULT_TRACKERS).distinct()
                 buildString {
                     append("magnet:?xt=urn:btih:").append(value)
-                    item.strings("sources").filter { it.startsWith("tracker:") }.forEach {
-                        append("&tr=").append(java.net.URLEncoder.encode(it.removePrefix("tracker:"), "UTF-8"))
+                    trackers.forEach { tracker ->
+                        append("&tr=").append(java.net.URLEncoder.encode(tracker, "UTF-8"))
                     }
                 }
             }
-            val magnet = rawUrl.takeIf { it.startsWith("magnet:?", true) } ?: hashMagnet
+            val rawMagnet = rawUrl.takeIf { it.startsWith("magnet:?", true) }
+            val magnet = rawMagnet?.let { raw ->
+                if (!raw.contains("&tr=")) {
+                    buildString {
+                        append(raw)
+                        DEFAULT_TRACKERS.forEach { tracker ->
+                            append("&tr=").append(java.net.URLEncoder.encode(tracker, "UTF-8"))
+                        }
+                    }
+                } else raw
+            } ?: hashMagnet
             if (url == null && magnet == null) return@mapNotNull null
             val subtitles = item.items("subtitles").mapNotNull { raw ->
                 val sub = raw.obj() ?: return@mapNotNull null

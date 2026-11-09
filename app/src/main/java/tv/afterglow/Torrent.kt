@@ -11,11 +11,6 @@ import androidx.media3.datasource.BaseDataSource
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
 import com.frostwire.jlibtorrent.AddTorrentParams
-import com.frostwire.jlibtorrent.AlertListener
-import com.frostwire.jlibtorrent.alerts.Alert
-import com.frostwire.jlibtorrent.alerts.AlertType
-import com.frostwire.jlibtorrent.alerts.PeerDisconnectedAlert
-import com.frostwire.jlibtorrent.alerts.TorrentErrorAlert
 import com.frostwire.jlibtorrent.FileStorage
 import com.frostwire.jlibtorrent.InfoHash
 import com.frostwire.jlibtorrent.Priority
@@ -26,6 +21,7 @@ import com.frostwire.jlibtorrent.TorrentFlags
 import com.frostwire.jlibtorrent.TorrentHandle
 import com.frostwire.jlibtorrent.TorrentInfo
 import com.frostwire.jlibtorrent.swig.settings_pack.bool_types
+import com.frostwire.jlibtorrent.swig.settings_pack.int_types
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import java.io.EOFException
@@ -37,19 +33,31 @@ import java.util.Locale
 internal data class TorrentVideo(val index: Int, val name: String, val bytes: Long)
 
 internal class TorrentEngine(context: Context, magnet: String) {
-    companion object { val exclusive = Mutex() }
+    companion object {
+        private const val TAG = "AfterglowTorrent"
+        val exclusive = Mutex()
+    }
 
     private val lock = Any()
     @Volatile private var canceled = false
-    private val manager = SessionManager()
-    private val params = AddTorrentParams.parseMagnetUri(magnet)
+    private val manager = SessionManager(true)
+    private val preparedMagnet = if (!magnet.contains("&tr=")) {
+        buildString {
+            append(magnet)
+            DEFAULT_TRACKERS.forEach {
+                append("&tr=").append(Uri.encode(it))
+            }
+        }
+    } else magnet
+    private val params = AddTorrentParams.parseMagnetUri(preparedMagnet)
     private val hash: InfoHash = params.getInfoHashes()
     private val root = File(context.cacheDir, "torrent-playback")
     private val cache: File
     private lateinit var handle: TorrentHandle
     private lateinit var info: TorrentInfo
     private var priorityPiece = -1
-    private val debug = Log.isLoggable("AfterglowTorrent", Log.DEBUG)
+    private var windowEnd = -1
+    private var windowPieces = 0
 
     init {
         root.listFiles()?.forEach { it.deleteRecursively() }
@@ -57,23 +65,22 @@ internal class TorrentEngine(context: Context, magnet: String) {
         if (!cache.mkdirs()) throw FeedError("There’s no space to prepare torrent playback.")
         try {
             val settings = SettingsPack().apply {
-                setEnableLsd(false)
-                setBoolean(bool_types.enable_upnp.swigValue(), false)
-                setBoolean(bool_types.enable_natpmp.swigValue(), false)
+                setEnableDht(true)
+                setEnableLsd(true)
+                setBoolean(bool_types.enable_upnp.swigValue(), true)
+                setBoolean(bool_types.enable_natpmp.swigValue(), true)
+                // Finishing a playback window does not mean we're done with the peer.
+                setBoolean(bool_types.close_redundant_connections.swigValue(), false)
+                setBoolean(bool_types.strict_end_game_mode.swigValue(), false)
+                setBoolean(bool_types.smooth_connects.swigValue(), false)
                 setMaxMetadataSize(4 * 1024 * 1024)
                 uploadRateLimit(128 * 1024)
+                listenInterfaces("0.0.0.0:0,[::]:0")
+                connectionsLimit(200)
+                setInteger(int_types.connection_speed.swigValue(), 50)
+                setInteger(int_types.max_out_request_queue.swigValue(), 1500)
+                setInteger(int_types.request_queue_time.swigValue(), 3)
             }
-            if (debug) manager.addListener(object : AlertListener {
-                override fun types() = intArrayOf(AlertType.PEER_DISCONNECTED.swig(), AlertType.TORRENT_ERROR.swig())
-                override fun alert(alert: Alert<*>) {
-                    val code = when (alert) {
-                        is PeerDisconnectedAlert -> alert.error().value()
-                        is TorrentErrorAlert -> alert.error().value()
-                        else -> return
-                    }
-                    Log.d("AfterglowTorrent", "${alert.type()} code=$code")
-                }
-            })
             manager.start(SessionParams(settings).apply { setPosixDiskIO() })
             val native = params.swig()
             native.setSave_path(cache.absolutePath)
@@ -87,13 +94,39 @@ internal class TorrentEngine(context: Context, magnet: String) {
     }
 
     suspend fun metadata(): List<TorrentVideo> {
-        val limit = SystemClock.elapsedRealtime() + 45_000L
+        val started = SystemClock.elapsedRealtime()
+        var limit = started + 45_000L
+        var reportedPeers = -1
+        var foundPeer = false
+        var lastStatusLog = 0L
         while (SystemClock.elapsedRealtime() < limit) {
             val candidate = if (hash.hasV1()) manager.find(hash.v1) else manager.find(hash.v2)
-            if (candidate != null && candidate.isValid && candidate.status().hasMetadata()) {
+            val status = candidate?.takeIf { it.isValid }?.status()
+            val peers = status?.numPeers() ?: 0
+            val seeds = status?.numSeeds() ?: 0
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastStatusLog >= 5_000L) {
+                lastStatusLog = now
+                val elapsed = (now - started) / 1000
+                Log.i(TAG, "[METADATA_POLL] ${elapsed}s elapsed: candidateValid=${candidate?.isValid == true}, peers=$peers, seeds=$seeds, state=${status?.state()}, hasMetadata=${status?.hasMetadata() == true}")
+            }
+            if (peers != reportedPeers) {
+                reportedPeers = peers
+                Log.i(TAG, "[PEERS_CHANGED] Connected peers: $peers (seeds: $seeds)")
+            }
+            if (peers > 0 && !foundPeer) {
+                foundPeer = true
+                limit = started + 75_000L
+                Log.i(TAG, "[PEER_FOUND] First peer discovered. Extended metadata timeout to 75s.")
+            }
+            if (candidate != null && status?.hasMetadata() == true) {
+                // Upload mode holds payload requests while keeping the metadata peers connected.
+                val elapsedMs = SystemClock.elapsedRealtime() - started
+                Log.i(TAG, "[METADATA_FETCHED] Metadata acquired successfully in ${elapsedMs}ms.")
                 handle = candidate
                 info = candidate.torrentFile()
                 if (info.numFiles() !in 1..12_000 || info.pieceLength() <= 0) {
+                    Log.e(TAG, "[METADATA_UNSUPPORTED] Unsupported file list: numFiles=${info.numFiles()}, pieceLength=${info.pieceLength()}")
                     throw FeedError("This torrent’s file list is unsupported.")
                 }
                 val files = info.files()
@@ -106,30 +139,49 @@ internal class TorrentEngine(context: Context, magnet: String) {
                     if (size <= 0 || files.padFileAt(index) || !supportedVideo(file.name)) null
                     else TorrentVideo(index, file.name, size)
                 }
-                if (videos.isEmpty()) throw FeedError("This torrent contains no supported video files.")
+                if (videos.isEmpty()) {
+                    Log.e(TAG, "[METADATA_NO_VIDEO] Torrent has ${files.numFiles()} files, but none match supported video extensions.")
+                    throw FeedError("This torrent contains no supported video files.")
+                }
+                Log.i(TAG, "[METADATA_FILES] Total files: ${info.numFiles()}, supported video files: ${videos.size}")
                 return videos
             }
             delay(250)
         }
-        throw FeedError("Torrent metadata timed out. Try a source with more peers.")
+        val elapsedSec = (SystemClock.elapsedRealtime() - started) / 1000
+        if (foundPeer) {
+            Log.e(TAG, "[METADATA_TIMEOUT] Timed out after ${elapsedSec}s. Peers were found ($reportedPeers), but failed to retrieve metadata.")
+            throw FeedError("This source didn’t respond in time. Try another source.")
+        } else {
+            Log.e(TAG, "[ZERO_PEERS_TIMEOUT] Timed out after ${elapsedSec}s with ZERO peers discovered. Trackers or DHT failed to discover/connect to peers.")
+            throw FeedError("Nobody is sharing this source right now. Try another source.")
+        }
     }
 
     fun select(video: TorrentVideo): DataSource.Factory {
         val pieceLength = info.pieceLength()
-        val allowance = 512L * 1024 * 1024 + 2L * pieceLength
-        if (cache.usableSpace - allowance < video.bytes) {
-            throw FeedError("There isn’t enough free storage for this torrent file.")
+        val numPieces = info.numPieces()
+        val requiredBuffer = minOf(video.bytes, 350L * 1024 * 1024 + 2L * pieceLength)
+        if (cache.usableSpace < requiredBuffer) {
+            Log.e(TAG, "[STORAGE_INSUFFICIENT] Usable space ${cache.usableSpace} is insufficient for required buffer $requiredBuffer (video=${video.bytes})")
+            throw FeedError("There isn’t enough free storage to buffer this stream.")
         }
         val files = info.files()
         val file = safeFile(files.filePath(video.index))
         val fileOffset = files.fileOffset(video.index)
-        val lastPiece = ((fileOffset + video.bytes - 1) / pieceLength).toInt()
+        val firstPiece = (fileOffset / pieceLength).toInt().coerceIn(0, numPieces - 1)
+        val lastPiece = ((fileOffset + video.bytes - 1) / pieceLength).toInt().coerceIn(0, numPieces - 1)
         synchronized(lock) {
             checkOpen()
-            handle.unsetFlags(TorrentFlags.AUTO_MANAGED)
-            handle.prioritizeFiles(Array(files.numFiles()) { if (it == video.index) Priority.NORMAL else Priority.IGNORE })
+            windowPieces = ((8L * 1024 * 1024) / pieceLength).toInt().coerceIn(1, 16)
+            priorityPiece = firstPiece
+            windowEnd = minOf(firstPiece + windowPieces - 1, lastPiece)
+            // Set piece priorities once. Changing file priorities here would overwrite them asynchronously.
+            handle.prioritizePieces(Array(numPieces) {
+                if (it in firstPiece..windowEnd) Priority.SEVEN else Priority.IGNORE
+            })
             handle.unsetFlags(TorrentFlags.UPLOAD_MODE)
-            handle.resume()
+            scheduleDeadlines(firstPiece, firstPiece, windowEnd)
         }
         return DataSource.Factory { TorrentDataSource(this, file, video.bytes, fileOffset, pieceLength, lastPiece) }
     }
@@ -145,37 +197,64 @@ internal class TorrentEngine(context: Context, magnet: String) {
     internal fun waitFor(piece: Int, last: Int, seek: Boolean) {
         synchronized(lock) {
             checkOpen()
-            if (seek || priorityPiece != piece) {
-                if (seek || priorityPiece < 0 || piece < priorityPiece || piece > priorityPiece + 1) {
-                    handle.clearPieceDeadlines()
+            if (priorityPiece != piece) {
+                val reset = seek || piece < priorityPiece || piece > priorityPiece + 1
+                val end = minOf(piece + windowPieces - 1, last)
+                if (reset) handle.clearPieceDeadlines()
+                val first = if (reset) piece else windowEnd + 1
+                for (next in first..end) {
+                    if (!handle.havePiece(next)) handle.piecePriority(next, Priority.SEVEN)
                 }
-                for (index in piece..minOf(piece + 11, last)) {
-                    if (!handle.havePiece(index)) handle.setPieceDeadline(index, (index - piece) * 175)
+                for (old in priorityPiece..windowEnd) {
+                    if (old !in piece..end && !handle.havePiece(old)) handle.piecePriority(old, Priority.IGNORE)
                 }
+                scheduleDeadlines(piece, first, end)
                 priorityPiece = piece
+                windowEnd = end
             }
         }
-        waitUntilAvailable(piece, SystemClock.elapsedRealtime() + 40_000L)
+        waitUntilAvailable(piece, SystemClock.elapsedRealtime() + 45_000L)
+    }
+
+    private fun scheduleDeadlines(piece: Int, first: Int, last: Int) {
+        for (next in first..last) {
+            if (!handle.havePiece(next)) handle.setPieceDeadline(next, (next - piece) * 200)
+        }
     }
 
     private fun waitUntilAvailable(piece: Int, until: Long) {
-        var nextStatus = SystemClock.elapsedRealtime() + 1_000
+        val started = SystemClock.elapsedRealtime()
+        var nextStatus = started + 1_000
         while (true) {
             synchronized(lock) {
                 checkOpen()
-                if (handle.havePiece(piece)) return
+                if (handle.havePiece(piece)) {
+                    val waitTime = SystemClock.elapsedRealtime() - started
+                    if (waitTime > 300) {
+                        Log.d(TAG, "[BUFFER_PIECE_READY] Piece $piece became available after ${waitTime}ms")
+                    }
+                    return
+                }
                 if (SystemClock.elapsedRealtime() >= nextStatus) {
                     val status = handle.status()
                     val error = status.errorCode().value()
-                    if (debug) Log.d("AfterglowTorrent",
-                        "Waiting for piece $piece, peers=${status.numPeers()}, bytes=${status.totalDone()}, code=$error")
-                    if (error != 0) throw IOException("Torrent storage error $error.")
+                    val downRateKb = status.downloadRate() / 1024
+                    Log.d(TAG,
+                        "[BUFFER_WAIT] Waiting for piece $piece: peers=${status.numPeers()}, seeds=${status.numSeeds()}, downRate=${downRateKb}KB/s, bytesDone=${status.totalDone()}, errorCode=$error")
+                    if (error != 0) {
+                        Log.e(TAG, "[BUFFER_STORAGE_ERROR] Torrent storage error $error while waiting for piece $piece")
+                        throw IOException("Torrent storage error $error.")
+                    }
                     nextStatus = SystemClock.elapsedRealtime() + 3_000
                 }
             }
-            if (SystemClock.elapsedRealtime() >= until) throw IOException("Torrent pieces timed out.")
+            if (SystemClock.elapsedRealtime() >= until) {
+                val status = handle.status()
+                Log.e(TAG, "[BUFFER_TIMEOUT] Timed out waiting for piece $piece after 45s (peers=${status.numPeers()}, downRate=${status.downloadRate() / 1024}KB/s, bytesDone=${status.totalDone()})")
+                throw IOException("Torrent pieces timed out.")
+            }
             try {
-                Thread.sleep(120)
+                Thread.sleep(50)
             } catch (interrupted: InterruptedException) {
                 Thread.currentThread().interrupt()
                 throw IOException("Torrent playback stopped.", interrupted)
@@ -219,6 +298,7 @@ private class TorrentDataSource(
         else minOf(dataSpec.length, size - position)
         uri = dataSpec.uri
         newRange = true
+
         transferStarted(dataSpec)
         return remaining
     }

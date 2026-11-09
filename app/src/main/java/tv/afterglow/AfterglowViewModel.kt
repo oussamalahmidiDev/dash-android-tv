@@ -8,6 +8,7 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
@@ -15,6 +16,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 internal enum class Tab(val title: String) {
     HOME("Home"), SEARCH("Search"), MOVIES("Movies"), SERIES("Series"), LIVE("Live TV"), SETTINGS("Settings")
@@ -39,9 +41,12 @@ internal class AfterglowViewModel(application: Application) : AndroidViewModel(a
     private var detailsJob: Job? = null
     private var sourceJob: Job? = null
     private var searchJob: Job? = null
+    private var playerSourceJob: Job? = null
 
     var ready by mutableStateOf(false); private set
     var busy by mutableStateOf(false); private set
+    var needsSetup by mutableStateOf(false); private set
+    var setupErrors by mutableStateOf(emptyList<String>()); private set
     var notice by mutableStateOf<String?>(null); private set
     var settingsStatus by mutableStateOf<SettingsStatus?>(null); private set
     var local by mutableStateOf(LocalLibrary()); private set
@@ -55,7 +60,7 @@ internal class AfterglowViewModel(application: Application) : AndroidViewModel(a
     var tab by mutableStateOf(Tab.HOME); private set
     var details by mutableStateOf<Details?>(null); private set
     var playback by mutableStateOf<PlayRequest?>(null); private set
-    var liveMinimized by mutableStateOf(false); private set
+    var playerMinimized by mutableStateOf(false); private set
     var sourceSetup by mutableStateOf<SettingsSection?>(null); private set
     var query by mutableStateOf(""); private set
     var searching by mutableStateOf(false); private set
@@ -67,6 +72,7 @@ internal class AfterglowViewModel(application: Application) : AndroidViewModel(a
     init {
         viewModelScope.launch {
             try {
+                needsSetup = library.needsSetup()
                 val saved = library.restore()
                 local = saved.local
                 addons = saved.addons
@@ -82,9 +88,34 @@ internal class AfterglowViewModel(application: Application) : AndroidViewModel(a
             } finally {
                 ready = true
             }
-            loadCinemetaCatalogs()
+            if (!needsSetup) loadCinemetaCatalogs()
         }
     }
+
+    fun finishSetup(addIptv: Boolean, addTorrentio: Boolean) =
+        change("Couldn’t save setup. Try again.") {
+            setupErrors = emptyList()
+            val errors = mutableListOf<String>()
+            if (addIptv && local.playlist?.url != STARTER_IPTV) {
+                val imported = attempt { library.import(Playlist(STARTER_IPTV, allowHttp = true)) }
+                if (imported != null) local = imported else errors += "Couldn’t import the public IPTV playlist."
+            }
+            if (addTorrentio && addons.none { it.url == STARTER_TORRENTIO.httpUrl()?.toString() }) {
+                val addon = attempt { library.install(STARTER_TORRENTIO, false) }
+                if (addon == null) errors += "Couldn’t install Torrentio."
+                else {
+                    val updated = addons.filterNot { it.key == addon.key } + addon
+                    library.saveAddons(updated, shelves)
+                    addons = updated
+                }
+            }
+            setupErrors = errors
+            if (errors.isEmpty()) {
+                library.completeSetup()
+                needsSetup = false
+                viewModelScope.launch { loadCinemetaCatalogs() }
+            }
+        }
 
     private suspend fun loadCinemetaCatalogs() {
         val addon = addons.firstOrNull { it.url == CINEMETA_MANIFEST } ?: return
@@ -288,6 +319,8 @@ internal class AfterglowViewModel(application: Application) : AndroidViewModel(a
 
     suspend fun featuredDetails(title: Title): Title = attempt { library.detail(addons, title) } ?: title
 
+    var targetResumePosition by mutableStateOf<Long?>(null); private set
+
     fun open(title: Title, resume: Resume? = null) {
         if (title.kind == Kind.LIVE) {
             val entry = local.entryIndex[title.id.removePrefix("iptv:")] ?: return
@@ -302,7 +335,6 @@ internal class AfterglowViewModel(application: Application) : AndroidViewModel(a
             val expanded = attempt { library.detail(addons, title) } ?: title
             if (details?.title?.key == title.key) {
                 details = details?.copy(title = expanded, loading = false)
-                if (resume != null) pickSources(resume.episode)
             }
         }
     }
@@ -314,8 +346,12 @@ internal class AfterglowViewModel(application: Application) : AndroidViewModel(a
             sources = emptyList(), error = null)
         sourceJob = viewModelScope.launch {
             try {
-                val sources = library.sources(addons, local, title, episode)
-                details = details?.copy(findingSources = false, sources = sources)
+                library.sources(addons, local, title, episode) { batch ->
+                    withContext(Dispatchers.Main) {
+                        details = details?.let { it.copy(sources = it.sources + batch) }
+                    }
+                }
+                details = details?.copy(findingSources = false)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (failure: Exception) {
@@ -342,30 +378,135 @@ internal class AfterglowViewModel(application: Application) : AndroidViewModel(a
         details?.let { pickSources(it.episode) }
     }
 
+    val lastChosenSources = mutableMapOf<String, Source>()
+    var playerSources by mutableStateOf<List<Source>>(emptyList()); private set
+    var loadingPlayerSources by mutableStateOf(false); private set
+
+    fun loadSourcesForPlayer(title: Title, episode: Episode?) {
+        playerSourceJob?.cancel()
+        val known = details?.takeIf {
+            it.showSources && it.title.key == title.key && it.episode?.id == episode?.id
+                && !it.findingSources && it.sources.isNotEmpty()
+        }
+        playerSources = known?.sources.orEmpty()
+        loadingPlayerSources = known == null
+        if (known != null) return
+
+        playerSourceJob = viewModelScope.launch {
+            try {
+                playerSources = library.sources(addons, local, title, episode)
+                loadingPlayerSources = false
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                loadingPlayerSources = false
+            }
+        }
+    }
+
+    fun rememberSource(title: Title, episode: Episode?, source: Source) {
+        val key = playbackKey(title, episode)
+        lastChosenSources[key] = source
+        val existing = progress.firstOrNull { it.key == key }
+        val updated = if (existing != null) {
+            existing.copy(source = source)
+        } else {
+            Resume(title, episode, 0L, System.currentTimeMillis(), null, source)
+        }
+        progress = listOf(updated) + progress.filterNot { it.key == key }
+        viewModelScope.launch {
+            progressWrites.withLock { attempt { library.progress(key, updated) } }
+        }
+    }
+
     fun selectSource(source: Source) {
         val active = details ?: return
         if (source.url == null && !p2p) {
             openSourceSetup(SettingsSection.PLAYBACK)
             return
         }
-        start(active.title, active.episode, source)
+        val targetPos = targetResumePosition
+        targetResumePosition = null
+        rememberSource(active.title, active.episode, source)
+        start(active.title, active.episode, source, targetPos)
     }
 
-    private fun start(title: Title, episode: Episode?, source: Source) {
+    fun resumePlayback(title: Title, resume: Resume, fromBeginning: Boolean = false) {
+        val targetPos = if (fromBeginning) 0L else resume.position
+        val key = playbackKey(title, resume.episode)
+        val savedSource = resume.source ?: lastChosenSources[key]
+        if (savedSource != null && (savedSource.url != null || p2p)) {
+            start(title, resume.episode, savedSource, targetPos, reuse = !fromBeginning)
+        } else {
+            sourceJob?.cancel()
+            detailsJob?.cancel()
+            details = Details(title, episode = resume.episode, showSources = true, findingSources = true, loading = false)
+            sourceJob = viewModelScope.launch {
+                try {
+                    val sources = library.sources(addons, local, title, resume.episode)
+                    val best = sources.firstOrNull { it.url != null || p2p }
+                    details = details?.copy(findingSources = false, sources = sources)
+                    targetResumePosition = targetPos
+                    if (best != null) selectSource(best)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (failure: Exception) {
+                    targetResumePosition = targetPos
+                    details = details?.copy(findingSources = false, error = failure.display("Couldn’t load streams."))
+                }
+            }
+        }
+    }
+
+    fun changeSource() {
+        val current = playback ?: return
+        val title = current.title
+        val episode = current.episode
+        val pos = current.resume
+        exitPlayback()
+        details = Details(title, episode = episode, showSources = true)
+        targetResumePosition = pos
+        pickSources(episode)
+    }
+
+    private fun start(
+        title: Title, episode: Episode?, source: Source, startPosition: Long? = null, reuse: Boolean = true
+    ) {
         val key = playbackKey(title, episode)
-        liveMinimized = false
-        playback = PlayRequest(title, episode, source, progress.firstOrNull { it.key == key }?.position ?: 0)
+        val current = playback
+        if (playerMinimized && current != null && playbackKey(current.title, current.episode) == key
+            && current.source == source && reuse) {
+            expandPlayer()
+            return
+        }
+        playerSourceJob?.cancel()
+        playerMinimized = false
+        val pos = startPosition ?: (progress.firstOrNull { it.key == key }?.position ?: 0)
+        playback = PlayRequest(title, episode, source, pos)
     }
 
-    fun minimizeLive() {
-        if (playback?.title?.kind == Kind.LIVE) liveMinimized = true
+    fun minimize() {
+        if (playback != null) playerMinimized = true
     }
 
-    fun expandLive() { liveMinimized = false }
+    fun expandPlayer() { playerMinimized = false }
+
+    var volume by mutableStateOf(100); private set
+
+    fun updateVolume(level: Int) {
+        volume = level.coerceIn(0, 100)
+    }
+
+    fun switchPlayerSource(source: Source) {
+        val current = playback ?: return
+        rememberSource(current.title, current.episode, source)
+        playback = current.copy(source = source)
+    }
 
     fun exitPlayback() {
+        playerSourceJob?.cancel()
         playback = null
-        liveMinimized = false
+        playerMinimized = false
     }
 
     fun toggleFavorite(title: Title, onSaved: (Boolean) -> Unit = {}) {
@@ -382,7 +523,8 @@ internal class AfterglowViewModel(application: Application) : AndroidViewModel(a
         val key = playbackKey(request.title, request.episode)
         val knownDuration = duration.takeIf { it > 0 } ?: progress.firstOrNull { it.key == key }?.duration
         val item = if (ended) null else Resume(
-            request.title, request.episode, position, System.currentTimeMillis(), knownDuration
+            request.title, request.episode, position, System.currentTimeMillis(), knownDuration,
+            lastChosenSources[key] ?: request.source
         )
         progress = listOfNotNull(item) + progress.filterNot { it.key == key }
         viewModelScope.launch {

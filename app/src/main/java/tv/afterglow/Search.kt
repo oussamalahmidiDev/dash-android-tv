@@ -134,7 +134,7 @@ internal fun SearchScreen(model: AfterglowViewModel) {
             }
             LazyColumn(
                 modifier = Modifier.weight(1f), state = grid,
-                contentPadding = PaddingValues(start = BrowseRail, end = BrowseRail, top = gap, bottom = 40.dp),
+                contentPadding = PaddingValues(start = BrowseRail, end = BrowseRail, top = gap, bottom = 56.dp),
                 verticalArrangement = Arrangement.spacedBy(gap)
             ) {
                 when {

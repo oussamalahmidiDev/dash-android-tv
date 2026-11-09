@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.CircularProgressIndicator
@@ -18,8 +19,15 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.focusRestorer
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.semantics.LiveRegionMode
@@ -37,6 +45,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.compose.foundation.shape.RoundedCornerShape
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -56,6 +65,25 @@ internal fun LiveScreen(model: AfterglowViewModel) {
             else -> channels.filter { it.group == selected }
         }
     }
+    val resultFocus = remember { FocusRequester() }
+    val categoryFocus = remember { FocusRequester() }
+    val backToCategories = Modifier.onPreviewKeyEvent { event ->
+        event.key == Key.DirectionUp && event.type == KeyEventType.KeyDown && categoryFocus.tryFocus()
+    }
+    val resultState = rememberLazyListState()
+    var openGroup by remember { mutableIntStateOf(0) }
+    LaunchedEffect(openGroup) {
+        if (openGroup != 0) {
+            resultState.scrollToItem(0)
+            withFrameNanos { }
+            resultFocus.tryFocus()
+        }
+    }
+    fun enterGroup(group: String?) {
+        model.group(group)
+        openGroup++
+    }
+
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
     LaunchedEffect(Unit) {
         while (true) {
@@ -63,71 +91,90 @@ internal fun LiveScreen(model: AfterglowViewModel) {
             delay(30_000)
         }
     }
-    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(start = Rail, end = Rail, top = 77.dp, bottom = 32.dp),
-        verticalArrangement = Arrangement.spacedBy(9.dp)) {
-        item {
+    Column(Modifier.fillMaxSize().padding(top = 77.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
+        Column(Modifier.padding(horizontal = Rail)) {
             Heading("Live TV", size = 38)
             Muted("Your channels, now and next.")
         }
         if (channels.isEmpty()) {
-            item {
-                Column(verticalArrangement = Arrangement.spacedBy(9.dp)) {
-                    Muted(if (local.playlist == null) "Add an IPTV playlist to tune live channels."
-                    else "Set at least one playlist group to Live TV to see channels here.")
-                    Action("Open Settings", TvGlyph.SETTINGS, preferred = true, primary = true) { model.go(Tab.SETTINGS) }
-                }
+            Column(Modifier.padding(horizontal = Rail), verticalArrangement = Arrangement.spacedBy(9.dp)) {
+                Muted(if (local.playlist == null) "Add an IPTV playlist to tune live channels."
+                else "Set at least one playlist group to Live TV to see channels here.")
+                Action("Open Settings", TvGlyph.SETTINGS, preferred = true, primary = true) { model.go(Tab.SETTINGS) }
             }
         } else {
-            item("filters") {
-                LazyRow(horizontalArrangement = Arrangement.spacedBy(9.dp),
-                    contentPadding = PaddingValues(vertical = 5.dp), modifier = Modifier.focusGroup()) {
-                    item { Action("All channels", TvGlyph.GRID, "live/all", preferred = true, primary = selected == null) { model.group(null) } }
-                    item { Action("Favorites", TvGlyph.STAR, "live/favs", primary = selected == FAVORITES_GROUP) { model.group(FAVORITES_GROUP) } }
-                    items(groups, key = { it }) { group ->
-                        Action(group, TvGlyph.FOLDER, "live/group/$group", primary = selected == group) { model.group(group) }
+            LazyRow(
+                Modifier.focusRequester(categoryFocus).focusRestorer().onRemoteDown { resultFocus.tryFocus() },
+                horizontalArrangement = Arrangement.spacedBy(9.dp),
+                contentPadding = PaddingValues(horizontal = Rail, vertical = 7.dp)
+            ) {
+                item {
+                    Action("All channels", TvGlyph.GRID, "live/all", preferred = true, primary = selected == null) {
+                        enterGroup(null)
                     }
                 }
-            }
-            item("columns") {
-                Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp)) {
-                    Muted("Channel", Modifier.weight(.32f), size = 13)
-                    Muted("On now", Modifier.weight(.36f), size = 13)
-                    Muted("Up next", Modifier.weight(.32f), size = 13)
-                    Spacer(Modifier.width(65.dp))
+                item {
+                    Action("Favorites", TvGlyph.STAR, "live/favs", primary = selected == FAVORITES_GROUP) {
+                        enterGroup(FAVORITES_GROUP)
+                    }
+                }
+                items(groups, key = { it }) { group ->
+                    Action(group, TvGlyph.FOLDER, "live/group/$group", primary = selected == group) { enterGroup(group) }
                 }
             }
-            if (visible.isEmpty()) item { Muted("Favorite a channel to pin it here.") }
-            items(visible, key = Title::key) { channel ->
-                val entry = local.entryIndex[channel.id.removePrefix("iptv:")]
-                val guide = local.schedule[entry?.channelId].orEmpty()
-                val current = guide.lastOrNull { it.start <= now && it.end > now }
-                val next = guide.firstOrNull { it.start > now }
-                val favorite = channel.key in favoriteKeys
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    RemoteButton("live/channel/${channel.key}", Modifier.weight(1f), onClick = { model.open(channel) }) {
-                        Row(Modifier.fillMaxWidth().background(Slate).padding(12.dp),
-                            verticalAlignment = Alignment.CenterVertically) {
-                            Row(Modifier.weight(.32f).padding(end = 9.dp),
-                                verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                if (channel.poster.isNotBlank()) {
-                                    Artwork(channel.poster, channel.allowHttp, Modifier.size(37.dp, 25.dp),
-                                        androidx.compose.ui.layout.ContentScale.Fit)
+            LazyColumn(
+                Modifier.weight(1f).fillMaxWidth().focusRequester(resultFocus).focusGroup(),
+                state = resultState,
+                contentPadding = PaddingValues(start = Rail, end = Rail, bottom = 56.dp),
+                verticalArrangement = Arrangement.spacedBy(9.dp)
+            ) {
+                item("columns") {
+                    Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp)) {
+                        Muted("Channel", Modifier.weight(.32f), size = 13)
+                        Muted("On now", Modifier.weight(.36f), size = 13)
+                        Muted("Up next", Modifier.weight(.32f), size = 13)
+                        Spacer(Modifier.width(65.dp))
+                    }
+                }
+                if (visible.isEmpty()) item {
+                    Column(backToCategories, verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Muted("Add a channel to Favorites using the star beside it.")
+                        Action("Browse all channels", TvGlyph.GRID, "live/browse-all") { enterGroup(null) }
+                    }
+                }
+                items(visible, key = Title::key) { channel ->
+                    val entry = local.entryIndex[channel.id.removePrefix("iptv:")]
+                    val guide = local.schedule[entry?.channelId].orEmpty()
+                    val current = guide.lastOrNull { it.start <= now && it.end > now }
+                    val next = guide.firstOrNull { it.start > now }
+                    val favorite = channel.key in favoriteKeys
+                    val back = if (channel == visible.firstOrNull()) backToCategories else Modifier
+                    Row(Modifier.fillMaxWidth().then(back), verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        RemoteButton("live/channel/${channel.key}", Modifier.weight(1f), onClick = { model.open(channel) }) {
+                            Row(Modifier.fillMaxWidth().background(Slate).padding(12.dp),
+                                verticalAlignment = Alignment.CenterVertically) {
+                                Row(Modifier.weight(.32f).padding(end = 9.dp),
+                                    verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    if (channel.poster.isNotBlank()) {
+                                        Artwork(channel.poster, channel.allowHttp, Modifier.size(37.dp, 25.dp),
+                                            androidx.compose.ui.layout.ContentScale.Fit)
+                                    }
+                                    if (channel.poster.isBlank()) Glyph(TvGlyph.LIVE, Fog, Modifier.size(22.dp))
+                                    Text(channel.name, fontSize = 14.sp, color = Porcelain, maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.SemiBold)
                                 }
-                                if (channel.poster.isBlank()) Glyph(TvGlyph.LIVE, Fog, Modifier.size(22.dp))
-                                Text(channel.name, fontSize = 14.sp, color = Porcelain, maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.SemiBold)
+                                Programme(current, "No programme listed", Modifier.weight(.36f).padding(end = 9.dp))
+                                Programme(next, "—", Modifier.weight(.32f).padding(end = 9.dp))
+                                Glyph(TvGlyph.PLAY, Porcelain, Modifier.size(18.dp))
                             }
-                            Programme(current, "No programme listed", Modifier.weight(.36f).padding(end = 9.dp))
-                            Programme(next, "—", Modifier.weight(.32f).padding(end = 9.dp))
-                            Glyph(TvGlyph.PLAY, Porcelain, Modifier.size(18.dp))
                         }
+                        IconAction(
+                            if (favorite) TvGlyph.STAR_FILLED else TvGlyph.STAR,
+                            if (favorite) "Remove ${channel.name} from favorites" else "Add ${channel.name} to favorites",
+                            "live/favorite/${channel.key}"
+                        ) { model.toggleFavorite(channel) }
                     }
-                    IconAction(
-                        if (favorite) TvGlyph.STAR_FILLED else TvGlyph.STAR,
-                        if (favorite) "Remove ${channel.name} from favorites" else "Add ${channel.name} to favorites",
-                        "live/favorite/${channel.key}"
-                    ) { model.toggleFavorite(channel) }
                 }
             }
         }
@@ -169,6 +216,9 @@ internal fun SettingsScreen(
     var reveal by remember { mutableStateOf(false) }
     var confirm by remember { mutableStateOf(false) }
     var confirmPlaylistRemoval by remember { mutableStateOf(false) }
+    var confirmReset by remember { mutableStateOf(false) }
+    var resetFailed by remember { mutableStateOf(false) }
+    val context = androidx.compose.ui.platform.LocalContext.current
     val keyboard = LocalSoftwareKeyboardController.current
     val status = model.settingsStatus?.takeIf { it.section == section || it.phase == StatusPhase.WORKING }
     val openSection: (SettingsSection) -> Unit = {
@@ -187,7 +237,7 @@ internal fun SettingsScreen(
 
     Box(Modifier.fillMaxSize()) {
         LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(start = Rail, end = Rail, top = if (returnToSources == null) 77.dp else 25.dp,
-            bottom = if (status == null) 29.dp else 88.dp),
+            bottom = if (status == null) 56.dp else 96.dp),
             verticalArrangement = Arrangement.spacedBy(11.dp)) {
             item {
                 if (returnToSources != null) {
@@ -315,6 +365,23 @@ internal fun SettingsScreen(
                     }
                 }
             }
+            if (returnToSources == null && section == SettingsSection.PLAYBACK) item("reset") {
+                Spacer(Modifier.height(12.dp))
+                Heading("App data", size = 20)
+                Action("Reset DASH", TvGlyph.TRASH, "settings/reset", enabled = !model.busy) {
+                    resetFailed = false
+                    confirmReset = true
+                }
+                if (resetFailed) Muted("Android couldn’t clear DASH data.")
+            }
+        }
+        if (confirmReset) {
+            ConfirmDashAction("Reset DASH?", "This clears your sources, favorites, watch history, settings, and cache. Open DASH again to start setup.",
+                "Cancel", "Reset DASH", onDismiss = { confirmReset = false }) {
+                confirmReset = false
+                val manager = context.getSystemService(android.app.ActivityManager::class.java)
+                resetFailed = manager?.clearApplicationUserData() != true
+            }
         }
         if (status != null) {
             SettingsFeedback(status, Modifier.align(Alignment.BottomCenter)
@@ -343,7 +410,7 @@ private fun SettingsFeedback(status: SettingsStatus, modifier: Modifier = Modifi
 internal fun GroupsScreen(model: AfterglowViewModel) {
     val entries = remember(model.local) { model.local.entries.groupingBy(FeedEntry::group).eachCount().entries.sortedBy { it.key } }
     val groups = model.local.playlist?.groups.orEmpty()
-    LazyColumn(Modifier.fillMaxSize().background(Ink), contentPadding = PaddingValues(Rail, 26.dp),
+    LazyColumn(Modifier.fillMaxSize().background(Ink), contentPadding = PaddingValues(start = Rail, top = 26.dp, end = Rail, bottom = 56.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)) {
         item {
             Action("Done", TvGlyph.CHECK, "groups/done", preferred = true, primary = true) { model.showGroups(false) }
@@ -396,36 +463,71 @@ internal fun DetailScreen(detail: Details, model: AfterglowViewModel) {
         first != null -> "Play first episode"
         else -> null
     }
+    val listState = rememberLazyListState()
+    val coroutineScope = rememberCoroutineScope()
+    var overviewHasFocus by remember { mutableStateOf(false) }
     BoxWithConstraints(Modifier.fillMaxSize().background(BrowseBackground)) {
         val series = title.kind == Kind.SERIES
         val stageHeight = (maxHeight * (if (series) .82f else 1f)).coerceAtLeast(310.dp)
         val descriptionWidth = (maxWidth * .46f).coerceAtLeast(240.dp)
         val episodeWidth = (maxWidth * .218f).coerceAtLeast(150.dp)
         val castWidth = (maxWidth * .24f).takeIf { maxWidth >= 660.dp }
-        SpotlightColumn(contentPadding = PaddingValues(bottom = if (series) 35.dp else 0.dp)) {
+        val actionsWidth = (maxWidth - (castWidth ?: 0.dp) - BrowseRail * 2).coerceAtLeast(descriptionWidth)
+        SpotlightColumn(
+            state = listState,
+            contentPadding = PaddingValues(bottom = if (series) 56.dp else 48.dp),
+            bottomInset = 56.dp
+        ) {
             item("overview") {
-                Box(Modifier.fillMaxWidth().height(stageHeight)) {
+                Box(Modifier.fillMaxWidth().height(stageHeight).onFocusChanged { state ->
+                    val isFocused = state.hasFocus
+                    if (isFocused && (!overviewHasFocus || listState.firstVisibleItemScrollOffset > 0 || listState.firstVisibleItemIndex > 0)) {
+                        coroutineScope.launch {
+                            listState.animateScrollToItem(0, 0)
+                        }
+                    }
+                    overviewHasFocus = isFocused
+                }) {
                     SpotlightBackdrop(title, BrowseBackground)
                     IconAction(TvGlyph.BACK, "Back", "detail/back",
                         Modifier.align(Alignment.TopStart).padding(start = BrowseRail, top = 21.dp),
                         preferred = action == null, onClick = model::backFromDetails)
-                    Column(Modifier.align(Alignment.BottomStart).padding(start = BrowseRail, bottom = 29.dp)
-                        .width(descriptionWidth), verticalArrangement = Arrangement.spacedBy(9.dp)) {
+                    Column(Modifier.align(Alignment.BottomStart).padding(start = BrowseRail, bottom = if (series) 32.dp else 48.dp)
+                        .widthIn(max = actionsWidth),
+                        verticalArrangement = Arrangement.spacedBy(9.dp)) {
                         SpotlightTitle(title, compact = stageHeight < 370.dp)
                         SpotlightMetadata(title)
-                        if (title.description.isNotBlank()) Muted(title.description, size = 15, maxLines = 4)
-                        Row(Modifier.padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(11.dp)) {
-                            if (action != null) {
-                                SpotlightAction(action, TvGlyph.PLAY, "detail/watch", preferred = true) {
-                                    model.pickSources(if (resume != null) resume.episode else first.takeIf { title.kind == Kind.SERIES })
+                        if (title.description.isNotBlank()) {
+                            Box(Modifier.width(descriptionWidth)) {
+                                Muted(title.description, size = 15, maxLines = 4)
+                            }
+                        }
+                        Column(Modifier.padding(top = 4.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                if (resume != null) {
+                                    SpotlightAction("Resume", TvGlyph.PLAY, "detail/resume", preferred = true) {
+                                        model.resumePlayback(title, resume, fromBeginning = false)
+                                    }
+                                    SpotlightAction("Start from beginning", TvGlyph.RETRY, "detail/restart") {
+                                        model.resumePlayback(title, resume, fromBeginning = true)
+                                    }
+                                } else if (action != null) {
+                                    SpotlightAction(action, TvGlyph.PLAY, "detail/watch", preferred = true) {
+                                        model.pickSources(first.takeIf { title.kind == Kind.SERIES })
+                                    }
+                                }
+                                SpotlightFavorite(favorite, "detail/favorite") { model.toggleFavorite(title) }
+                            }
+                            if (resume != null) {
+                                SpotlightAction("Start with different source", TvGlyph.GRID, "detail/sources") {
+                                    model.pickSources(resume.episode)
                                 }
                             }
-                            SpotlightFavorite(favorite, "detail/favorite") { model.toggleFavorite(title) }
                         }
                     }
                     if (title.cast.isNotEmpty() && castWidth != null) {
-                        Column(Modifier.align(Alignment.BottomEnd).padding(end = BrowseRail, bottom = 35.dp)
+                        Column(Modifier.align(Alignment.BottomEnd).padding(end = BrowseRail, bottom = if (series) 36.dp else 48.dp)
                             .width(castWidth), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                             Text("Starring", color = Porcelain, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                             Muted(title.cast.take(3).joinToString(", "), size = 13, maxLines = 2)
@@ -508,20 +610,21 @@ private fun SourcePicker(detail: Details, model: AfterglowViewModel) {
     val title = detail.title
     val sourceId = detail.episode?.id ?: title.id
     val hasStreamAddon = model.addons.any { it.supports("stream", title.kind.stremioType(), sourceId) }
-    Box(Modifier.fillMaxSize().background(Ink)) {
+    BoxWithConstraints(Modifier.fillMaxSize().background(Ink)) {
+        val columns = if (maxWidth >= 900.dp) 3 else 2
         Box(Modifier.fillMaxWidth().height(290.dp)) { SpotlightBackdrop(title, Ink) }
-        LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(Rail, 27.dp),
+        LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(start = Rail, top = 27.dp, end = Rail, bottom = 56.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)) {
             item("source-header") {
                 IconAction(TvGlyph.BACK, "Back", "detail/back",
-                    preferred = detail.findingSources, onClick = model::backFromDetails)
+                    preferred = detail.findingSources && detail.sources.isEmpty(), onClick = model::backFromDetails)
                 Spacer(Modifier.height(19.dp))
                 SpotlightMetadata(title)
                 Heading(title.name, size = 40)
             }
             item("source-heading") {
                 Heading(detail.episode?.name?.let { "Sources for $it" } ?: "Choose a source")
-                if (detail.findingSources) Muted("Finding streams…")
+                if (detail.findingSources) Muted(if (detail.sources.isEmpty()) "Finding streams…" else "Looking for more sources…")
                 else if (detail.sources.isEmpty()) {
                     Muted(detail.error ?: when {
                         title.iptv -> "This playlist entry is no longer available."
@@ -533,13 +636,29 @@ private fun SourcePicker(detail: Details, model: AfterglowViewModel) {
                     }
                 } else detail.error?.let { Muted(it) }
             }
-            items(detail.sources.withIndex().toList(), key = { it.index }) { (index, source) ->
-                val transport = if (source.url != null) "Direct video" else if (model.p2p) "Torrent" else "Torrent playback off"
-                val description = source.description.trim()
-                val caption = "${source.provider}  /  $transport" + if (description.isEmpty()) "" else "\n$description"
-                ListItem("detail/source/$index", source.label, caption, preferred = index == 0,
-                    icon = if (source.url == null && !model.p2p) TvGlyph.SETTINGS else TvGlyph.PLAY, subtitleLines = 3) {
-                    model.selectSource(source)
+            val chunked = detail.sources.withIndex().chunked(columns)
+            items(chunked, key = { row -> row.first().value.provider + row.first().value.label + row.first().index }) { row ->
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    for ((index, source) in row) {
+                        Box(Modifier.weight(1f)) {
+                            SourceGridCard(
+                                id = "detail/source/$index",
+                                source = source,
+                                p2p = model.p2p,
+                                preferred = index == 0,
+                                onClick = { model.selectSource(source) }
+                            )
+                        }
+                    }
+                    val remainder = columns - row.size
+                    if (remainder > 0) {
+                        repeat(remainder) {
+                            Spacer(Modifier.weight(1f))
+                        }
+                    }
                 }
             }
             if (!detail.findingSources && detail.sources.isEmpty()) item("retry") {
@@ -553,6 +672,82 @@ private fun SourcePicker(detail: Details, model: AfterglowViewModel) {
                         model.pickSources(detail.episode)
                     }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SourceGridCard(
+    id: String, source: Source, p2p: Boolean, preferred: Boolean = false,
+    onClick: () -> Unit
+) {
+    val transport = if (source.url != null) "Direct" else if (p2p) "Torrent" else "Torrent off"
+    val disabledTorrent = source.url == null && !p2p
+    val description = source.description.trim()
+    RemoteButton(id, Modifier.fillMaxWidth(), preferred = preferred, radius = 14, onClick = onClick) { focused ->
+        val tint = if (focused) Ink else Porcelain
+        val mutedTint = if (focused) Ink.copy(alpha = 0.72f) else Fog
+        Column(
+            Modifier.fillMaxWidth()
+                .background(if (focused) Porcelain else Slate, RoundedCornerShape(14.dp))
+                .padding(horizontal = 14.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(5.dp)
+        ) {
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Box(
+                        Modifier.background(
+                            if (focused) Ink.copy(alpha = 0.12f) else Glacier.copy(alpha = 0.20f),
+                            RoundedCornerShape(6.dp)
+                        ).padding(horizontal = 6.dp, vertical = 2.dp)
+                    ) {
+                        Text(
+                            transport,
+                            color = if (focused) Ink else Glacier,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                    Text(
+                        source.provider,
+                        color = mutedTint,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                Glyph(
+                    if (disabledTorrent) TvGlyph.SETTINGS else TvGlyph.PLAY,
+                    tint,
+                    Modifier.size(16.dp)
+                )
+            }
+            Text(
+                source.label,
+                color = tint,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            if (description.isNotBlank()) {
+                Text(
+                    description,
+                    color = mutedTint,
+                    fontSize = 12.sp,
+                    lineHeight = 15.sp,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
             }
         }
     }

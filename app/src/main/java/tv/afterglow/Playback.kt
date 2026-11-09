@@ -5,6 +5,7 @@ package tv.afterglow
 import android.annotation.SuppressLint
 import android.content.Context
 import android.net.Uri
+import android.util.Log
 import android.view.LayoutInflater
 import android.view.KeyEvent as AndroidKeyEvent
 import androidx.activity.compose.BackHandler
@@ -17,6 +18,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -24,17 +26,22 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.focusProperties
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
@@ -52,10 +59,12 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.common.Tracks
+import androidx.media3.common.VideoSize
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.TransferListener
 import androidx.media3.datasource.okhttp.OkHttpDataSource
+import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.PlayerView
@@ -74,7 +83,13 @@ import okhttp3.Request
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 
-private data class Prepared(val item: MediaItem, val factory: DataSource.Factory, val torrent: Boolean = false)
+private data class Prepared(val item: MediaItem, val factory: DataSource.Factory, val engine: TorrentEngine? = null) {
+    val torrent get() = engine != null
+}
+
+private val directFileExtensions = setOf(
+    "m3u8", "mpd", "ism", "isml", "mp4", "m4v", "mkv", "webm", "mov", "ts", "m2ts", "avi"
+)
 
 private fun direct(source: Source): Prepared {
     val url = Network.checked(checkNotNull(source.url), source.allowHttp)
@@ -88,9 +103,10 @@ private fun direct(source: Source): Prepared {
         }
         chain.proceed(builder.build())
     }.build()
-    val type = source.mime ?: attempt {
+    val extension = url.encodedPath.substringAfterLast('.').lowercase(Locale.ROOT)
+    val type = source.mime ?: if (extension in directFileExtensions) null else attempt {
         val call = client.newCall(Request.Builder().head().url(url).build())
-        call.timeout().timeout(4, TimeUnit.SECONDS)
+        call.timeout().timeout(1500, TimeUnit.MILLISECONDS)
         call.execute().use { response ->
             val contentType = response.header("Content-Type")?.substringBefore(';')?.trim()?.lowercase(Locale.ROOT)
             if (!response.isSuccessful) null else when (contentType) {
@@ -122,7 +138,7 @@ private fun torrentMedia(engine: TorrentEngine, video: TorrentVideo, source: Sou
     val item = MediaItem.Builder().setUri(uri).setSubtitleConfigurations(subtitleConfigurations(source)).build()
     val videoFactory = engine.select(video)
     val subtitleFactory = OkHttpDataSource.Factory(Network.client(source.allowHttp))
-    return Prepared(item, DataSource.Factory { TorrentMediaDataSource(videoFactory, subtitleFactory) }, torrent = true)
+    return Prepared(item, DataSource.Factory { TorrentMediaDataSource(videoFactory, subtitleFactory) }, engine)
 }
 
 private class TorrentMediaDataSource(
@@ -156,7 +172,7 @@ private class TorrentMediaDataSource(
 @Composable
 internal fun PlaybackScreen(
     request: PlayRequest, modifier: Modifier, minimized: Boolean, minimize: () -> Unit, expand: () -> Unit,
-    onExit: () -> Unit, onStarted: () -> Unit, record: (Long, Long, Boolean) -> Unit
+    model: AfterglowViewModel, onExit: () -> Unit, onStarted: () -> Unit, record: (Long, Long, Boolean) -> Unit
 ) {
     val context = LocalContext.current.applicationContext
     val lifecycle = LocalLifecycleOwner.current.lifecycle
@@ -172,37 +188,40 @@ internal fun PlaybackScreen(
     var problem by remember { mutableStateOf<String?>(null) }
     var files by remember { mutableStateOf(emptyList<TorrentVideo>()) }
     var retry by remember { mutableIntStateOf(0) }
-    val selection = remember(retry) { Channel<TorrentVideo>(capacity = 1) }
+    val activeSource = request.source
+    val selection = remember(activeSource, retry) { Channel<TorrentVideo>(capacity = 1) }
     var engine by remember { mutableStateOf<TorrentEngine?>(null) }
-    var resumePosition by remember { mutableLongStateOf(request.resume) }
-    val exit = { engine?.cancel(); onExit() }
-    BackHandler(enabled = prepared == null && !minimized, onBack = exit)
+    var resumePosition by remember(request.token) { mutableLongStateOf(request.resume) }
+    val stop = { engine?.cancel(); onExit() }
+    BackHandler(enabled = prepared == null && !minimized) {
+        if (problem == null) minimize() else stop()
+    }
 
-    LaunchedEffect(request.token, retry) {
+    LaunchedEffect(activeSource, retry) {
         val job = currentCoroutineContext().job
         preparation.set(job)
         files = emptyList()
         prepared = null
         problem = null
         try {
-            if (request.source.url != null) {
-                prepared = withContext(Dispatchers.IO) { direct(request.source) }
+            if (activeSource.url != null) {
+                prepared = withContext(Dispatchers.IO) { direct(activeSource) }
             } else {
                 TorrentEngine.exclusive.withLock {
                     // Assignment inside the IO block keeps a reference available for cancellation.
                     var active: TorrentEngine? = null
                     try {
                         val metadata = withContext(Dispatchers.IO) {
-                            TorrentEngine(context, checkNotNull(request.source.magnet)).also { active = it }.metadata()
+                            TorrentEngine(context, checkNotNull(activeSource.magnet)).also { active = it }.metadata()
                         }
                         val torrent = checkNotNull(active)
                         engine = torrent
-                        val video = metadata.firstOrNull { it.index == request.source.fileIndex }
+                        val video = metadata.firstOrNull { it.index == activeSource.fileIndex }
                             ?: metadata.singleOrNull() ?: run {
                                 files = metadata
                                 selection.receive().also { files = emptyList() }
                             }
-                        prepared = withContext(Dispatchers.IO) { torrentMedia(torrent, video, request.source) }
+                        prepared = withContext(Dispatchers.IO) { torrentMedia(torrent, video, activeSource) }
                         awaitCancellation()
                     } finally {
                         active?.cancel()
@@ -214,8 +233,10 @@ internal fun PlaybackScreen(
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (failure: Exception) {
+            Log.e("AfterglowTorrent", "[PREPARATION_ERROR] ${failure.javaClass.simpleName}")
             problem = (failure as? FeedError)?.message ?: "This stream couldn’t be prepared."
-        } catch (_: LinkageError) {
+        } catch (linkage: LinkageError) {
+            Log.e("AfterglowTorrent", "[LINKAGE_ERROR] ${linkage.javaClass.simpleName}")
             problem = "Torrent playback is unavailable on this device."
         } finally {
             preparation.compareAndSet(job, null)
@@ -227,31 +248,83 @@ internal fun PlaybackScreen(
     Box(modifier.then(appearance).background(Color.Black)) {
         val media = prepared
         if (media != null) {
-            Video(media, request, resumePosition, minimized, minimize, expand, exit, onStarted, { position, duration, ended ->
-                if (request.title.kind != Kind.LIVE) {
-                    resumePosition = if (ended) 0 else position
-                    record(position, duration, ended)
-                }
-            }) { retry++ }
+            key(media) {
+                Video(
+                    media, request, activeSource, resumePosition, minimized, minimize, expand,
+                    sources = model.playerSources,
+                    loadingSources = model.loadingPlayerSources,
+                    p2p = model.p2p,
+                    volume = model.volume,
+                    setVolume = model::updateVolume,
+                    loadSources = { model.loadSourcesForPlayer(request.title, request.episode) },
+                    onSwitchSource = model::switchPlayerSource,
+                    stop, onStarted, { position, duration, ended ->
+                        if (request.title.kind != Kind.LIVE) {
+                            resumePosition = if (ended) 0 else position
+                            record(position, duration, ended)
+                        }
+                    }
+                ) { retry++ }
+            }
+        } else if (minimized) {
+            MiniPlayerControls(playbackTitle(request), problem != null, expand, stop)
+            if (problem == null && files.isEmpty()) Loading(Modifier.align(Alignment.Center))
         } else {
             val error = problem
-            LazyColumn(Modifier.fillMaxSize().background(Ink),
-                contentPadding = PaddingValues(horizontal = Rail, vertical = 30.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                item {
-                    IconAction(TvGlyph.BACK, "Back", "player/prepare/back", preferred = true, onClick = exit)
-                    Spacer(Modifier.height(16.dp))
-                    Heading(request.episode?.name ?: request.title.name, size = 34)
-                    Muted(error ?: when {
-                        files.isNotEmpty() -> "Choose a video file."
-                        request.source.magnet != null -> "Finding peers and reading torrent metadata…"
-                        else -> "Opening stream…"
+            val poster = request.title.backdrop.ifBlank { request.title.poster }
+            Box(Modifier.fillMaxSize().background(Ink)) {
+                if (poster.isNotBlank()) {
+                    Artwork(poster, request.title.allowHttp, Modifier.fillMaxSize(), ContentScale.Crop)
+                    Box(Modifier.fillMaxSize().background(
+                        Brush.radialGradient(listOf(Ink.copy(alpha = 0.55f), Ink.copy(alpha = 0.94f)), radius = 1400f)
+                    ))
+                    Box(Modifier.fillMaxSize().background(
+                        Brush.verticalGradient(listOf(Ink.copy(alpha = 0.65f), Color.Transparent, Ink.copy(alpha = 0.85f), Ink))
+                    ))
+                }
+                Box(Modifier.align(Alignment.TopStart).padding(start = BrowseRail, top = 27.dp)) {
+                    IconAction(TvGlyph.BACK, "Back", "player/prepare/back", preferred = files.isEmpty() && error == null, onClick = {
+                        if (error == null) minimize() else stop()
                     })
                 }
-                if (error != null) item { IconAction(TvGlyph.RETRY, "Retry", "player/prepare/retry", primary = true) { retry++ } }
-                items(files, key = TorrentVideo::index) { file ->
-                    val megabytes = file.bytes / (1024 * 1024)
-                    ListItem("player/file/${file.index}", file.name, "$megabytes MB") { selection.trySend(file) }
+                if (files.isNotEmpty()) {
+                    Column(
+                        Modifier.align(Alignment.Center).widthIn(max = 640.dp).padding(horizontal = 24.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Heading("Choose a video file", size = 26)
+                        LazyColumn(
+                            Modifier.fillMaxWidth().heightIn(max = 340.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            items(files, key = TorrentVideo::index) { file ->
+                                val megabytes = file.bytes / (1024 * 1024)
+                                ListItem("player/file/${file.index}", file.name, "$megabytes MB", preferred = file.index == files.first().index) {
+                                    selection.trySend(file)
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    Column(
+                        Modifier.align(Alignment.Center).padding(horizontal = 32.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(16.dp)
+                    ) {
+                        if (error != null) {
+                            Heading(request.episode?.name ?: request.title.name, size = 30)
+                            Muted(error, size = 15)
+                            Spacer(Modifier.height(4.dp))
+                            Action("Try again", TvGlyph.RETRY, "player/prepare/retry", preferred = true, primary = true) { retry++ }
+                        } else {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(46.dp),
+                                color = Glacier,
+                                strokeWidth = 3.dp
+                            )
+                            Loading()
+                        }
+                    }
                 }
             }
         }
@@ -261,8 +334,12 @@ internal fun PlaybackScreen(
 @SuppressLint("InflateParams")
 @Composable
 private fun Video(
-    prepared: Prepared, request: PlayRequest, initialPosition: Long, minimized: Boolean,
-    minimize: () -> Unit, expand: () -> Unit, exit: () -> Unit, onStarted: () -> Unit,
+    prepared: Prepared, request: PlayRequest, activeSource: Source, initialPosition: Long, minimized: Boolean,
+    minimize: () -> Unit, expand: () -> Unit,
+    sources: List<Source>, loadingSources: Boolean, p2p: Boolean,
+    volume: Int, setVolume: (Int) -> Unit,
+    loadSources: () -> Unit, onSwitchSource: (Source) -> Unit,
+    exit: () -> Unit, onStarted: () -> Unit,
     record: (Long, Long, Boolean) -> Unit, retry: () -> Unit
 ) {
     val context = LocalContext.current
@@ -270,7 +347,20 @@ private fun Video(
     val latestRecord by rememberUpdatedState(record)
     val latestStarted by rememberUpdatedState(onStarted)
     val live = request.title.kind == Kind.LIVE
-    val player = remember(prepared) { makePlayer(context, prepared, initialPosition.takeUnless { live } ?: 0L) }
+    val player = remember(prepared) {
+        makePlayer(context, prepared, initialPosition.takeUnless { live } ?: 0L,
+            volume, live || !minimized)
+    }
+    LaunchedEffect(player, volume) { player.volume = volume / 100f }
+    var videoSize by remember(player) { mutableStateOf(VideoSize.UNKNOWN) }
+    val quality = when {
+        videoSize.width >= 3700 || videoSize.height >= 2100 -> "4K"
+        videoSize.width >= 2500 || videoSize.height >= 1400 -> "1440p"
+        videoSize.width >= 1850 || videoSize.height >= 1000 -> "1080p"
+        videoSize.width >= 1200 || videoSize.height >= 680 -> "720p"
+        videoSize.height > 0 -> "${videoSize.height}p"
+        else -> sourceQuality(activeSource)
+    }
     var playing by remember { mutableStateOf(false) }
     var playRequested by remember(player) { mutableStateOf(player.playWhenReady) }
     var stage by remember(player) { mutableIntStateOf(player.playbackState) }
@@ -281,15 +371,47 @@ private fun Video(
     var visible by remember { mutableStateOf(true) }
     var activity by remember { mutableIntStateOf(0) }
     var trackType by remember { mutableStateOf<Int?>(null) }
+    var showSourcePicker by remember { mutableStateOf(false) }
+    var showVolume by remember { mutableStateOf(false) }
+    var resumeOnExpand by remember(player) { mutableStateOf(true) }
+    var wasExpanded by remember(player) { mutableStateOf(!minimized) }
+    val volumeFocus = remember { FocusRequester() }
+    var restoreVolumeFocus by remember { mutableStateOf(false) }
     var ended by remember { mutableStateOf(false) }
     var hasPlayed by remember { mutableStateOf(false) }
     val hiddenFocus = remember { FocusRequester() }
+    val timelineFocus = remember { FocusRequester() }
+    var timelineFocused by remember { mutableStateOf(false) }
+    var focusTimeline by remember { mutableStateOf(false) }
+    var seekPreview by remember(player) { mutableStateOf<Long?>(null) }
+    val canSeek = !live && duration > 0 && player.isCurrentMediaItemSeekable
     val overlayMemory = remember { FocusMemory() }
     val audioFocus = remember { FocusRequester() }
     val subtitleFocus = remember { FocusRequester() }
     var returningToTrack by remember { mutableStateOf<Int?>(null) }
 
     fun showControls() { visible = true; activity++ }
+    fun previewSeek(delta: Long) {
+        val base = seekPreview ?: player.currentPosition
+        seekPreview = (base + delta).coerceIn(0L, duration)
+        showControls()
+    }
+    LaunchedEffect(seekPreview) {
+        val target = seekPreview ?: return@LaunchedEffect
+        delay(230)
+        player.seekTo(target)
+        position = target
+        seekPreview = null
+    }
+    LaunchedEffect(focusTimeline) {
+        if (focusTimeline) {
+            // Let the reopened overlay restore its button focus before moving to the timeline.
+            withFrameNanos { }
+            withFrameNanos { }
+            timelineFocus.tryFocus()
+            focusTimeline = false
+        }
+    }
     fun toggle() {
         if (player.playWhenReady && !ended) player.pause()
         else {
@@ -307,6 +429,19 @@ private fun Video(
         returningToTrack = type
         trackType = null
         showControls()
+    }
+
+    fun closeVolume() {
+        showVolume = false
+        restoreVolumeFocus = true
+        showControls()
+    }
+    LaunchedEffect(restoreVolumeFocus) {
+        if (restoreVolumeFocus) {
+            withFrameNanos { }
+            volumeFocus.tryFocus()
+            restoreVolumeFocus = false
+        }
     }
 
     DisposableEffect(player, lifecycle) {
@@ -332,6 +467,14 @@ private fun Video(
 
             override fun onPlaybackStateChanged(playbackState: Int) {
                 stage = playbackState
+                val stateName = when (playbackState) {
+                    Player.STATE_IDLE -> "IDLE"
+                    Player.STATE_BUFFERING -> "BUFFERING"
+                    Player.STATE_READY -> "READY"
+                    Player.STATE_ENDED -> "ENDED"
+                    else -> "UNKNOWN($playbackState)"
+                }
+                Log.i("AfterglowTorrent", "[PLAYER_STATE] state=$stateName, isTorrent=${prepared.torrent}, playWhenReady=${player.playWhenReady}, pos=${player.currentPosition}ms")
                 if (playbackState == Player.STATE_ENDED) {
                     ended = true
                     latestRecord(0, player.duration, true)
@@ -340,18 +483,23 @@ private fun Video(
             }
 
             override fun onPlayerError(problem: PlaybackException) {
+                Log.e("AfterglowTorrent", "[PLAYER_ERROR] code=${problem.errorCode}, isTorrent=${prepared.torrent}, msg=${problem.message}", problem)
                 error = problem
                 trackType = null
+                showSourcePicker = false
+                showVolume = false
                 showControls()
             }
 
             override fun onTracksChanged(updated: Tracks) { tracks = updated }
+            override fun onVideoSizeChanged(size: VideoSize) { videoSize = size }
         }
         player.addListener(listener)
         onDispose {
             lifecycle.removeObserver(observer)
             if (hasPlayed || player.currentPosition > 0) latestRecord(player.currentPosition, player.duration, ended)
             player.removeListener(listener)
+            prepared.engine?.cancel()
             player.release()
         }
     }
@@ -370,10 +518,19 @@ private fun Video(
     }
     LaunchedEffect(minimized) {
         trackType = null
-        if (!minimized) showControls()
+        showSourcePicker = false
+        showVolume = false
+        if (minimized && !live) {
+            if (wasExpanded) resumeOnExpand = player.playWhenReady
+            player.pause()
+        } else if (!minimized) {
+            wasExpanded = true
+            if (!live && resumeOnExpand && !ended && error == null) player.play()
+            showControls()
+        }
     }
-    LaunchedEffect(minimized, visible, playing, activity, trackType, error) {
-        if (!minimized && visible && playing && trackType == null && error == null) {
+    LaunchedEffect(minimized, visible, playing, activity, trackType, showSourcePicker, showVolume, error) {
+        if (!minimized && visible && playing && trackType == null && !showSourcePicker && !showVolume && error == null) {
             delay(6_500)
             visible = false
         }
@@ -393,8 +550,10 @@ private fun Video(
     }
     BackHandler(!minimized) {
         when {
+            showVolume -> closeVolume()
+            showSourcePicker -> showSourcePicker = false
             trackType != null -> closeTrackPicker()
-            live && error == null -> minimize()
+            error == null -> minimize()
             else -> exit()
         }
     }
@@ -411,8 +570,19 @@ private fun Video(
             AndroidKeyEvent.KEYCODE_DPAD_CENTER, AndroidKeyEvent.KEYCODE_ENTER -> {
                 if (!visible) { toggle(); true } else { activity++; false }
             }
-            AndroidKeyEvent.KEYCODE_DPAD_UP, AndroidKeyEvent.KEYCODE_DPAD_DOWN,
             AndroidKeyEvent.KEYCODE_DPAD_LEFT, AndroidKeyEvent.KEYCODE_DPAD_RIGHT -> {
+                val wasHidden = !visible
+                if (canSeek && error == null && trackType == null && (wasHidden || timelineFocused || focusTimeline)) {
+                    val step = if (key.nativeKeyEvent.repeatCount >= 4) 60_000L else 10_000L
+                    if (wasHidden) focusTimeline = true
+                    previewSeek(if (code == AndroidKeyEvent.KEYCODE_DPAD_LEFT) -step else step)
+                    true
+                } else {
+                    showControls()
+                    wasHidden
+                }
+            }
+            AndroidKeyEvent.KEYCODE_DPAD_UP, AndroidKeyEvent.KEYCODE_DPAD_DOWN -> {
                 val wasHidden = !visible
                 showControls()
                 wasHidden
@@ -434,7 +604,8 @@ private fun Video(
         }
 
         if (minimized) {
-            MiniPlayerControls(request.title.name, error != null, expand, exit)
+            MiniPlayerControls(playbackTitle(request), error != null, expand, exit)
+            if (stage == Player.STATE_BUFFERING && error == null) Loading(Modifier.align(Alignment.Center))
             return@Box
         }
         if (!visible) Box(Modifier.size(1.dp).focusRequester(hiddenFocus).focusable())
@@ -443,7 +614,8 @@ private fun Video(
             FocusScope(overlayMemory, if (activeError == null) "video-controls" else "video-error") {
                 Box(Modifier.align(Alignment.TopStart).padding(start = Rail, top = 27.dp)) {
                     IconAction(if (live) TvGlyph.CLOSE else TvGlyph.BACK,
-                        if (live) "Stop channel" else "Back", "video/back", onClick = exit)
+                        if (live) "Stop channel" else "Back", "video/back",
+                        onClick = if (live || activeError != null) exit else minimize)
                 }
                 Column(
                     Modifier.align(Alignment.BottomCenter).fillMaxWidth().background(
@@ -451,19 +623,27 @@ private fun Video(
                     ).padding(start = Rail, end = Rail, top = 50.dp, bottom = 27.dp),
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    Heading(request.episode?.name ?: request.title.name, size = 28)
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Heading(playbackTitle(request), Modifier.weight(1f, fill = false), size = 28)
+                        if (quality != null) Muted(quality, Modifier.background(Slate, RoundedCornerShape(8.dp))
+                            .padding(horizontal = 9.dp, vertical = 4.dp), size = 13)
+                    }
                     if (activeError != null) {
                         Muted(playerError(activeError, prepared.torrent))
                         IconAction(TvGlyph.RETRY, "Retry", "video/retry", preferred = true, primary = true, onClick = retry)
                     } else {
                         if (!live && duration > 0) {
-                            Row(verticalAlignment = Alignment.CenterVertically,
+                            val displayedPosition = seekPreview ?: position
+                            val timeline = if (canSeek) Modifier.focusRequester(timelineFocus)
+                                .onFocusChanged { timelineFocused = it.isFocused }
+                                .semantics { contentDescription = "Timeline. Press left or right to seek." }.focusable() else Modifier
+                            Row(timeline.heightIn(min = 28.dp), verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                                Muted(time(position), size = 12)
-                                Box(Modifier.weight(1f).height(4.dp)
+                                Muted(time(displayedPosition), size = 12)
+                                Box(Modifier.weight(1f).height(if (timelineFocused) 7.dp else 4.dp)
                                     .background(Fog.copy(alpha = .36f), RoundedCornerShape(2.dp))) {
-                                    Box(Modifier.fillMaxWidth((position.toDouble() / duration).coerceIn(0.0, 1.0).toFloat())
-                                        .fillMaxHeight().background(Porcelain, RoundedCornerShape(2.dp)))
+                                    Box(Modifier.fillMaxWidth((displayedPosition.toDouble() / duration).coerceIn(0.0, 1.0).toFloat())
+                                        .fillMaxHeight().background(if (timelineFocused) Glacier else Porcelain, RoundedCornerShape(2.dp)))
                                 }
                                 Muted(time(duration), size = 12)
                             }
@@ -471,9 +651,16 @@ private fun Video(
                             Muted("Live TV", size = 12)
                         }
                         val shouldPause = playRequested && !ended
-                        Box(Modifier.fillMaxWidth().height(54.dp)) {
+                        BoxWithConstraints(Modifier.fillMaxWidth()) {
+                            val stacked = maxWidth < 450.dp
+                            val playbackAlignment = when {
+                                stacked -> Alignment.TopCenter
+                                maxWidth < 740.dp -> Alignment.CenterStart
+                                else -> Alignment.Center
+                            }
+                            Spacer(Modifier.height(if (stacked) 104.dp else 54.dp))
                             Row(
-                                Modifier.align(Alignment.Center),
+                                Modifier.align(playbackAlignment),
                                 horizontalArrangement = Arrangement.spacedBy(13.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
@@ -484,7 +671,8 @@ private fun Video(
                                     }
                                 }
                                 IconAction(if (shouldPause) TvGlyph.PAUSE else TvGlyph.PLAY,
-                                    if (shouldPause) "Pause" else "Play", "video/play", preferred = true,
+                                    if (shouldPause) "Pause" else "Play", "video/play",
+                                    Modifier.focusProperties { if (canSeek) up = timelineFocus }, preferred = true,
                                     primary = true, onClick = ::toggle)
                                 if (!live) {
                                     IconAction(TvGlyph.FORWARD, "Ahead 30 seconds", "video/seek-forward") {
@@ -493,18 +681,29 @@ private fun Video(
                                     }
                                 }
                             }
-                            Row(Modifier.align(Alignment.CenterEnd), horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            Row(Modifier.align(if (stacked) Alignment.BottomCenter else Alignment.CenterEnd),
+                                horizontalArrangement = Arrangement.spacedBy(if (maxWidth < 275.dp) 4.dp else 10.dp),
                                 verticalAlignment = Alignment.CenterVertically) {
-                                if (live) {
-                                    IconAction(TvGlyph.MINIMIZE, "Minimize live channel", "video/minimize", onClick = minimize)
+                                if (!live) {
+                                    IconAction(TvGlyph.GRID, "Change source", "video/change-source", onClick = {
+                                        trackType = null
+                                        showSourcePicker = true
+                                        loadSources()
+                                    })
+                                }
+                                IconAction(TvGlyph.MINIMIZE, "Minimize player", "video/minimize", onClick = minimize)
+                                IconAction(TvGlyph.AUDIO, "Volume", "video/volume", Modifier.focusRequester(volumeFocus)) {
+                                    showVolume = true
                                 }
                                 if (tracks.groups.any { it.type == C.TRACK_TYPE_AUDIO }) {
-                                    IconAction(TvGlyph.AUDIO, "Audio", "video/audio", Modifier.focusRequester(audioFocus)) {
+                                    IconAction(TvGlyph.AUDIO_TRACKS, "Audio tracks", "video/audio", Modifier.focusRequester(audioFocus)) {
+                                        showSourcePicker = false
                                         trackType = C.TRACK_TYPE_AUDIO
                                     }
                                 }
                                 if (tracks.groups.any { it.type == C.TRACK_TYPE_TEXT }) {
                                     IconAction(TvGlyph.SUBTITLES, "Subtitles", "video/subtitles", Modifier.focusRequester(subtitleFocus)) {
+                                        showSourcePicker = false
                                         trackType = C.TRACK_TYPE_TEXT
                                     }
                                 }
@@ -514,10 +713,16 @@ private fun Video(
                 }
             }
         }
-        if (stage == Player.STATE_BUFFERING && activeError == null && trackType == null) {
-            Muted(if (prepared.torrent) "Buffering verified pieces…" else "Buffering…",
-                Modifier.align(Alignment.Center).background(Color.Black.copy(alpha = .65f), RoundedCornerShape(8.dp))
-                    .padding(horizontal = 13.dp, vertical = 7.dp))
+        if (stage == Player.STATE_BUFFERING && activeError == null && trackType == null && !showSourcePicker && !showVolume) {
+            Loading(Modifier.align(Alignment.Center))
+        }
+        if (showVolume) {
+            Box(Modifier.align(Alignment.BottomEnd).padding(end = Rail, bottom = 111.dp)) {
+                Popup(alignment = Alignment.BottomEnd, onDismissRequest = ::closeVolume,
+                    properties = PopupProperties(focusable = true)) {
+                    FocusScope(overlayMemory, "volume") { VolumeControl(volume, setVolume, ::closeVolume) }
+                }
+            }
         }
         trackType?.let { type ->
             Box(Modifier.align(Alignment.BottomEnd).padding(end = Rail, bottom = 111.dp)) {
@@ -529,7 +734,68 @@ private fun Video(
                 }
             }
         }
+        if (showSourcePicker) {
+            Box(Modifier.align(Alignment.BottomEnd).padding(end = Rail, bottom = 111.dp)) {
+                Popup(alignment = Alignment.BottomEnd, onDismissRequest = { showSourcePicker = false },
+                    properties = PopupProperties(focusable = true)) {
+                    FocusScope(overlayMemory, "source-picker") {
+                        SourceFloatingPicker(
+                            sources = sources,
+                            currentSource = activeSource,
+                            loading = loadingSources,
+                            p2p = p2p,
+                            onSelect = { selectedSource ->
+                                showSourcePicker = false
+                                if (selectedSource != activeSource) {
+                                    onSwitchSource(selectedSource)
+                                }
+                            },
+                            close = { showSourcePicker = false }
+                        )
+                    }
+                }
+            }
+        }
     }
+}
+
+@Composable
+private fun Loading(modifier: Modifier = Modifier) {
+    Muted("Loading...", modifier.background(Color.Black.copy(alpha = .65f), RoundedCornerShape(8.dp))
+        .padding(horizontal = 13.dp, vertical = 7.dp))
+}
+
+@Composable
+private fun VolumeControl(volume: Int, setVolume: (Int) -> Unit, close: () -> Unit) {
+    Column(Modifier.width(256.dp).background(Slate, RoundedCornerShape(16.dp)).padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically) {
+            Heading("Volume", size = 20)
+            Muted("$volume%")
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            IconAction(TvGlyph.REMOVE, "Lower volume", "volume/down", preferred = true) {
+                setVolume((volume - 10).coerceAtLeast(0))
+            }
+            IconAction(TvGlyph.ADD, "Raise volume", "volume/up") {
+                setVolume((volume + 10).coerceAtMost(100))
+            }
+            IconAction(TvGlyph.CLOSE, "Close volume", "volume/close", onClick = close)
+        }
+    }
+}
+
+private fun playbackTitle(request: PlayRequest): String {
+    val episode = request.episode ?: return request.title.name
+    val number = listOfNotNull(episode.season?.let { "S$it" }, episode.number?.let { "E$it" }).joinToString(", ")
+    return listOf(number, episode.name).filter(String::isNotBlank).joinToString("  ·  ")
+}
+
+private val qualityPattern = Regex("""\b(4k|2160p|1440p|1080p|720p|480p|360p)\b""", RegexOption.IGNORE_CASE)
+private fun sourceQuality(source: Source): String? {
+    val value = qualityPattern.find(source.label + " " + source.description)?.value?.lowercase(Locale.ROOT)
+    return if (value == "2160p" || value == "4k") "4K" else value
 }
 
 @Composable
@@ -543,18 +809,36 @@ private fun BoxScope.MiniPlayerControls(title: String, failed: Boolean, expand: 
         .padding(start = 12.dp, end = 12.dp, top = 17.dp, bottom = 10.dp)) {
         Text(title, color = Porcelain, fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
             maxLines = 1, overflow = TextOverflow.Ellipsis)
-        if (failed) Muted("Channel unavailable. Open full screen to retry.", size = 11)
+        if (failed) Muted("Playback stopped. Open full screen to retry.", size = 11)
     }
 }
 
-private fun makePlayer(context: Context, media: Prepared, position: Long): ExoPlayer {
-    val player = ExoPlayer.Builder(context).setSeekBackIncrementMs(10_000)
-        .setSeekForwardIncrementMs(30_000).build()
-    player.setAudioAttributes(AudioAttributes.DEFAULT, true)
+private fun makePlayer(context: Context, media: Prepared, position: Long, volume: Int, autoplay: Boolean): ExoPlayer {
+    val loadControl = DefaultLoadControl.Builder()
+        .setBufferDurationsMs(
+            /* minBufferMs = */ 15_000,
+            /* maxBufferMs = */ 50_000,
+            /* bufferForPlaybackMs = */ 500,
+            /* bufferForPlaybackAfterRebufferMs = */ 2_000
+        )
+        .setPrioritizeTimeOverSizeThresholds(true)
+        .setBackBuffer(10_000, false)
+        .build()
+    val player = ExoPlayer.Builder(context)
+        .setLoadControl(loadControl)
+        .setSeekBackIncrementMs(10_000)
+        .setSeekForwardIncrementMs(30_000)
+        .build()
+    val audioAttributes = AudioAttributes.Builder()
+        .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
+        .setUsage(C.USAGE_MEDIA)
+        .build()
+    player.setAudioAttributes(audioAttributes, true)
     val factory = DefaultMediaSourceFactory(media.factory)
     player.setMediaSource(factory.createMediaSource(media.item), position)
+    player.volume = volume / 100f
+    player.playWhenReady = autoplay
     player.prepare()
-    player.playWhenReady = true
     return player
 }
 
@@ -625,13 +909,94 @@ private fun TrackPicker(player: Player, tracks: Tracks, type: Int, close: () -> 
     }
 }
 
+@Composable
+private fun SourceFloatingPicker(
+    sources: List<Source>, currentSource: Source, loading: Boolean, p2p: Boolean,
+    onSelect: (Source) -> Unit, close: () -> Unit
+) {
+    val shape = RoundedCornerShape(15.dp)
+    val selectedIndex = sources.indexOfFirst {
+        it.provider == currentSource.provider && it.label == currentSource.label
+    }.coerceAtLeast(0)
+    Column(
+        Modifier.width(280.dp).background(Color(0xF22B2B2B), shape)
+            .border(1.dp, Color.White.copy(alpha = .18f), shape).padding(11.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Row(
+            Modifier.fillMaxWidth().padding(start = 7.dp, bottom = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Heading("Sources", size = 16)
+            IconAction(TvGlyph.CLOSE, "Close", "sources/close", onClick = close)
+        }
+        if (loading) {
+            Row(
+                Modifier.padding(horizontal = 8.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                CircularProgressIndicator(Modifier.size(16.dp), color = Glacier, strokeWidth = 2.dp)
+                Muted("Finding sources…", size = 13)
+            }
+        } else if (sources.isEmpty()) {
+            Muted("No other streams available.", Modifier.padding(horizontal = 8.dp, vertical = 10.dp), size = 13)
+        } else {
+            LazyColumn(
+                Modifier.heightIn(max = 240.dp),
+                state = rememberLazyListState(selectedIndex),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                itemsIndexed(sources, key = { index, s -> s.provider + s.label + index }) { index, s ->
+                    val isSelected = s.provider == currentSource.provider && s.label == currentSource.label
+                    val transport = if (s.url != null) "Direct" else if (p2p) "Torrent" else "Torrent off"
+                    RemoteButton(
+                        id = "floating-sources/$index",
+                        modifier = Modifier.fillMaxWidth().semantics {
+                            role = Role.RadioButton
+                            selected = isSelected
+                        },
+                        preferred = index == selectedIndex,
+                        radius = 8,
+                        onClick = { onSelect(s) }
+                    ) { focused ->
+                        val tint = if (focused) Ink else Porcelain
+                        val mutedTint = if (focused) Ink.copy(alpha = 0.70f) else Fog
+                        Row(
+                            Modifier.fillMaxWidth().background(if (focused) Porcelain else Color.Transparent)
+                                .padding(horizontal = 8.dp, vertical = 7.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Glyph(
+                                if (isSelected) TvGlyph.CHECK else TvGlyph.RADIO,
+                                if (isSelected && !focused) Glacier else tint,
+                                Modifier.size(16.dp)
+                            )
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    s.label, color = tint, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
+                                    maxLines = 1, overflow = TextOverflow.Ellipsis
+                                )
+                                val desc = listOf(s.provider, transport, s.description.trim()).filter(String::isNotBlank).joinToString(" · ")
+                                Text(desc, color = mutedTint, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 private fun playerError(error: PlaybackException, torrent: Boolean): String = when (error.errorCode) {
     PlaybackException.ERROR_CODE_DECODER_INIT_FAILED, PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED ->
         "This TV doesn’t support the stream’s video or audio format."
     PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS -> "The server refused this stream. Try again or choose another source."
     PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT,
     PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED -> "The stream couldn’t connect. Check the network and try again."
-    else -> if (torrent) "Torrent playback stopped. Try again or choose a source with more peers."
+    else -> if (torrent) "This source stopped sending video. Try again or choose another source."
         else "The stream stopped. Retry or choose another source."
 }
 
