@@ -31,12 +31,15 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 private val SearchKinds = listOf(Kind.MOVIE, Kind.SERIES, Kind.LIVE)
+
+private data class SearchRowGroup(val rows: List<List<Title>>, val cardWidth: Dp)
 
 internal fun shouldShowSearchFilterTabs(query: String, hasResults: Boolean): Boolean =
     query.isNotBlank() && hasResults
@@ -91,6 +94,15 @@ internal fun SearchScreen(model: AfterglowViewModel) {
     BoxWithConstraints(Modifier.fillMaxSize().imePadding()) {
         val gap = 16.dp
         val gridWidth = (maxWidth - BrowseRail * 2).coerceAtLeast(1.dp)
+        val chunkedResults = remember(results, gridWidth, gap, visibleKinds) {
+            visibleKinds.associateWith { kind ->
+                val matches = results[kind].orEmpty()
+                val minWidth = if (kind == Kind.LIVE) 142.dp else 104.dp
+                val columns = ((gridWidth + gap) / (minWidth + gap)).toInt().coerceAtLeast(1)
+                val cardWidth = (gridWidth - gap * (columns - 1)) / columns
+                SearchRowGroup(matches.chunked(columns), cardWidth)
+            }
+        }
         Column(Modifier.fillMaxSize().padding(top = 79.dp)) {
             Row(Modifier.padding(horizontal = BrowseRail).widthIn(max = 730.dp).fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -200,18 +212,15 @@ internal fun SearchScreen(model: AfterglowViewModel) {
                 model.notice?.let { message -> item("notice") { Muted(message) } }
 
                 for (kind in visibleKinds) {
-                    val matches = results[kind].orEmpty()
-                    if (matches.isEmpty()) continue
-                    val minWidth = if (kind == Kind.LIVE) 142.dp else 104.dp
-                    val columns = ((gridWidth + gap) / (minWidth + gap)).toInt().coerceAtLeast(1)
-                    val cardWidth = (gridWidth - gap * (columns - 1)) / columns
+                    val group = chunkedResults[kind] ?: continue
+                    if (group.rows.isEmpty()) continue
                     item("header/$kind") {
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Glyph(kind.glyph, Fog, Modifier.size(18.dp))
                             Heading(kind.label, size = 19)
                         }
                     }
-                    itemsIndexed(matches.chunked(columns), key = { index, _ -> "search/$kind/$index" }) { index, row ->
+                    itemsIndexed(group.rows, key = { index, _ -> "search/$kind/$index" }) { index, row ->
                         Row(horizontalArrangement = Arrangement.spacedBy(gap)) {
                             for ((column, title) in row.withIndex()) key(title.key) {
                                 val focus = if (kind == firstKind && index == 0 && column == 0)
@@ -227,12 +236,12 @@ internal fun SearchScreen(model: AfterglowViewModel) {
                                     }
                                 }
                                 if (kind == Kind.LIVE) {
-                                    ChannelCard(title, "search/${title.key}", cardWidth, favorite = favorite,
+                                    ChannelCard(title, "search/${title.key}", group.cardWidth, favorite = favorite,
                                         modifier = focus) { model.open(title) }
                                 } else {
-                                    PortraitCard(title, "search/${title.key}", cardWidth, rank = null,
+                                    PortraitCard(title, "search/${title.key}", group.cardWidth, rank = null,
                                         preferred = false, favorite = favorite,
-                                        height = cardWidth * (if (editing) .76f else 1.5f), modifier = focus) { model.open(title) }
+                                        height = group.cardWidth * (if (editing) .76f else 1.5f), modifier = focus) { model.open(title) }
                                 }
                             }
                         }

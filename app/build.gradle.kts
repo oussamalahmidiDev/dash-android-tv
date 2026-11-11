@@ -13,8 +13,8 @@ android {
         applicationId = "tv.afterglow"
         minSdk = 26
         targetSdk = 36
-        versionCode = 20
-        versionName = "2.0.6"
+        versionCode = 21
+        versionName = "2.0.7"
     }
     buildFeatures { compose = true }
     compileOptions {

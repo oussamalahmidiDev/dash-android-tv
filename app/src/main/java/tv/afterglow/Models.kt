@@ -120,5 +120,15 @@ internal fun playbackKey(title: Title, episode: Episode?) = "${title.key}/${epis
 internal fun Kind.stremioType() = if (this == Kind.SERIES) "series" else "movie"
 internal fun kindFor(type: String) = when (type) { "movie" -> Kind.MOVIE; "series" -> Kind.SERIES; else -> null }
 
-internal fun digest(value: String): String = MessageDigest.getInstance("SHA-256")
-    .digest(value.toByteArray()).take(16).joinToString("") { "%02x".format(it) }
+private val HEX_CHARS = "0123456789abcdef".toCharArray()
+
+internal fun digest(value: String): String {
+    val hash = MessageDigest.getInstance("SHA-256").digest(value.toByteArray())
+    val chars = CharArray(32)
+    for (i in 0 until 16) {
+        val b = hash[i].toInt() and 0xFF
+        chars[i * 2] = HEX_CHARS[b ushr 4]
+        chars[i * 2 + 1] = HEX_CHARS[b and 0x0F]
+    }
+    return String(chars)
+}

@@ -31,7 +31,7 @@ class TorrentCacheTest {
         val directory = temporary.newFolder()
         val cache = TorrentCache(directory)
         val oldest = directory.resolve("older").apply {
-            RandomAccessFile(this, "rw").use { it.setLength(255L * 1024 * 1024) }
+            RandomAccessFile(this, "rw").use { it.setLength(399L * 1024 * 1024) }
             setLastModified(1_000)
         }
         val newer = directory.resolve("newer").apply {

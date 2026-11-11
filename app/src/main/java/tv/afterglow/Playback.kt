@@ -389,8 +389,11 @@ private fun Video(
     var timelineFocused by remember { mutableStateOf(false) }
     var focusTimeline by remember { mutableStateOf(false) }
     var seekPreview by remember(player) { mutableStateOf<Long?>(null) }
-    val canSeek = !live && duration > 0 && seekable
+    var liveEdgePosition by remember(player) { mutableLongStateOf(0L) }
+    val maxSeekTarget = if (live) liveEdgePosition.coerceAtLeast(position) else duration
     val canRewindLive = live && (seekable || player.isCurrentMediaItemSeekable)
+    val canSeek = (!live && duration > 0 && seekable) || (live && canRewindLive && maxSeekTarget > 0)
+    val isBehindLive = live && (maxSeekTarget - position > 3_000L)
     val bufferingProgress = if (live || duration <= 0) null else {
         val remaining = (duration - position).coerceAtLeast(1L)
         val target = minOf(remaining, if (rebuffering) RebufferMs.toLong() else InitialBufferMs.toLong())
@@ -520,13 +523,22 @@ private fun Video(
                 val target = liveRewindTarget(player.currentPosition)
                 player.seekTo(target)
                 position = target
+                seekPreview = null
             }
         } else player.seekBack()
         showControls()
     }
     fun previewSeek(delta: Long) {
         val base = seekPreview ?: player.currentPosition
-        seekPreview = (base + delta).coerceIn(0L, duration)
+        val maxLimit = if (live) maxSeekTarget.coerceAtLeast(base) else duration
+        seekPreview = if (maxLimit > 0) (base + delta).coerceIn(0L, maxLimit) else null
+        showControls()
+    }
+    fun seekToLive() {
+        val target = maxSeekTarget.coerceAtLeast(player.currentPosition)
+        player.seekTo(target)
+        position = target
+        seekPreview = null
         showControls()
     }
     LaunchedEffect(seekPreview) {
@@ -618,6 +630,22 @@ private fun Video(
                 seekable = player.isCurrentMediaItemSeekable
                 duration = player.duration
                 position = player.currentPosition
+                if (live) {
+                    val cur = player.currentPosition
+                    if (cur > liveEdgePosition) liveEdgePosition = cur
+                    if (!timeline.isEmpty) {
+                        val win = Timeline.Window()
+                        timeline.getWindow(player.currentMediaItemIndex, win)
+                        if (win.isLive()) {
+                            if (win.defaultPositionMs > 0 && win.defaultPositionMs != C.TIME_UNSET) {
+                                liveEdgePosition = maxOf(liveEdgePosition, win.defaultPositionMs)
+                            }
+                            if (win.durationMs > 0 && win.durationMs != C.TIME_UNSET) {
+                                liveEdgePosition = maxOf(liveEdgePosition, win.durationMs)
+                            }
+                        }
+                    }
+                }
             }
 
             override fun onTracksChanged(updated: Tracks) { tracks = updated }
@@ -641,6 +669,22 @@ private fun Video(
             bufferedPosition = player.bufferedPosition
             bufferedDuration = player.totalBufferedDuration
             seekable = player.isCurrentMediaItemSeekable
+            if (live) {
+                val cur = player.currentPosition
+                if (cur > liveEdgePosition) liveEdgePosition = cur
+                if (!player.currentTimeline.isEmpty) {
+                    val win = Timeline.Window()
+                    player.currentTimeline.getWindow(player.currentMediaItemIndex, win)
+                    if (win.isLive()) {
+                        if (win.defaultPositionMs > 0 && win.defaultPositionMs != C.TIME_UNSET) {
+                            liveEdgePosition = maxOf(liveEdgePosition, win.defaultPositionMs)
+                        }
+                        if (win.durationMs > 0 && win.durationMs != C.TIME_UNSET) {
+                            liveEdgePosition = maxOf(liveEdgePosition, win.durationMs)
+                        }
+                    }
+                }
+            }
             val saved = lastSaved
             if (!live && playing && position >= 1_000L &&
                 (saved == null || kotlin.math.abs(position - saved) >= 15_000L ||
@@ -754,7 +798,14 @@ private fun Video(
             if (activeCues.isEmpty() || minimized) null
             else {
                 val target = currentMs - subtitleDelayMs
-                activeCues.firstOrNull { it.startMs <= target && target <= it.endMs }?.text
+                val index = activeCues.binarySearch { cue ->
+                    when {
+                        target < cue.startMs -> 1
+                        target > cue.endMs -> -1
+                        else -> 0
+                    }
+                }
+                if (index >= 0) activeCues[index].text else null
             }
         }
 
@@ -821,34 +872,70 @@ private fun Video(
                         Muted(playerError(activeError, prepared.torrent))
                         IconAction(TvGlyph.RETRY, "Retry", "video/retry", preferred = true, primary = true, onClick = retry)
                     } else {
-                        if (!live && duration > 0) {
+                        if ((!live && duration > 0) || (live && canRewindLive && maxSeekTarget > 0)) {
                             val displayedPosition = seekPreview ?: position
+                            val maxLimit = if (live) maxSeekTarget else duration
+                            val progressFraction = (displayedPosition.toDouble() / maxLimit).coerceIn(0.0, 1.0).toFloat()
+                            val bufferFraction = if (live) 1f else (bufferedPosition.toDouble() / duration).coerceIn(0.0, 1.0).toFloat()
+                            val leftLabel = if (live) {
+                                val delayFromLive = (maxLimit - displayedPosition).coerceAtLeast(0L)
+                                if (delayFromLive > 3_000L) "-${time(delayFromLive)}" else time(displayedPosition)
+                            } else time(displayedPosition)
+                            val rightLabel = if (live) {
+                                val delayFromLive = (maxLimit - displayedPosition).coerceAtLeast(0L)
+                                if (delayFromLive <= 3_000L) "● LIVE" else "LIVE"
+                            } else time(duration)
+
                             val timeline = if (canSeek) Modifier
                                 .focusRequester(timelineFocus)
                                 .onFocusChanged { timelineFocused = it.isFocused }
                                 .focusProperties { down = playButtonFocus }
                                 .onPreviewKeyEvent { key ->
-                                    if (key.type == KeyEventType.KeyDown && key.nativeKeyEvent.keyCode == AndroidKeyEvent.KEYCODE_DPAD_UP) {
-                                        visible = false
-                                        timelineFocused = false
-                                        focusTimeline = false
-                                        hiddenFocus.requestFocus()
-                                        true
+                                    if (key.type == KeyEventType.KeyDown) {
+                                        when (key.nativeKeyEvent.keyCode) {
+                                            AndroidKeyEvent.KEYCODE_DPAD_UP -> {
+                                                visible = false
+                                                timelineFocused = false
+                                                focusTimeline = false
+                                                hiddenFocus.requestFocus()
+                                                true
+                                            }
+                                            AndroidKeyEvent.KEYCODE_DPAD_LEFT -> {
+                                                val step = if (key.nativeKeyEvent.repeatCount >= 4) 30_000L else 10_000L
+                                                previewSeek(-step)
+                                                true
+                                            }
+                                            AndroidKeyEvent.KEYCODE_DPAD_RIGHT -> {
+                                                val step = if (key.nativeKeyEvent.repeatCount >= 4) 30_000L else 10_000L
+                                                previewSeek(step)
+                                                true
+                                            }
+                                            AndroidKeyEvent.KEYCODE_DPAD_CENTER, AndroidKeyEvent.KEYCODE_ENTER -> {
+                                                seekPreview?.let { target ->
+                                                    player.seekTo(target)
+                                                    position = target
+                                                    seekPreview = null
+                                                }
+                                                true
+                                            }
+                                            else -> false
+                                        }
                                     } else false
                                 }
-                                .semantics { contentDescription = "Timeline. Press left or right to seek." }
+                                .semantics { contentDescription = if (live) "Live TV timeline. Press left to rewind, right to advance to live." else "Timeline. Press left or right to seek." }
                                 .focusable() else Modifier
                             Row(timeline.heightIn(min = 28.dp), verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                                Muted(time(displayedPosition), size = 12)
+                                Muted(leftLabel, size = 12)
                                 Box(Modifier.weight(1f).height(if (timelineFocused) 7.dp else 4.dp)
                                     .background(Fog.copy(alpha = .36f), RoundedCornerShape(2.dp))) {
-                                    Box(Modifier.fillMaxWidth((bufferedPosition.toDouble() / duration).coerceIn(0.0, 1.0).toFloat())
+                                    Box(Modifier.fillMaxWidth(bufferFraction)
                                         .fillMaxHeight().background(Porcelain.copy(alpha = .43f), RoundedCornerShape(2.dp)))
-                                    Box(Modifier.fillMaxWidth((displayedPosition.toDouble() / duration).coerceIn(0.0, 1.0).toFloat())
+                                    Box(Modifier.fillMaxWidth(progressFraction)
                                         .fillMaxHeight().background(if (timelineFocused) Porcelain else Fog, RoundedCornerShape(2.dp)))
                                 }
-                                Muted(time(duration), size = 12)
+                                Text(rightLabel, color = if (live && rightLabel.startsWith("●")) Glacier else Fog,
+                                    fontSize = 12.sp, fontWeight = if (live && rightLabel.startsWith("●")) FontWeight.Bold else FontWeight.Normal)
                             }
                         } else if (live) {
                             Muted("Live TV", size = 12)
@@ -883,6 +970,8 @@ private fun Video(
                                         player.seekForward()
                                         showControls()
                                     }
+                                } else if (isBehindLive) {
+                                    IconAction(TvGlyph.FORWARD, "Ahead to Live", "video/seek-live", onClick = ::seekToLive)
                                 }
                             }
                             Row(Modifier.align(if (stacked) Alignment.BottomCenter else Alignment.CenterEnd),
@@ -1415,6 +1504,9 @@ internal const val LiveRewindMs = 30_000L
 internal fun liveRewindTarget(currentPosition: Long, rewindAmountMs: Long = LiveRewindMs): Long =
     (currentPosition - rewindAmountMs).coerceAtLeast(0L)
 
+internal fun liveAdvanceTarget(currentPosition: Long, liveEdgePosition: Long, advanceAmountMs: Long = 10_000L): Long =
+    (currentPosition + advanceAmountMs).coerceAtMost(liveEdgePosition)
+
 private fun makePlayer(context: Context, media: Prepared, position: Long): ExoPlayer {
     val loadControl = DefaultLoadControl.Builder()
         .setBufferDurationsMs(
@@ -1440,6 +1532,7 @@ private fun makePlayer(context: Context, media: Prepared, position: Long): ExoPl
 
     val renderersFactory = DefaultRenderersFactory(context)
         .setEnableAudioTrackPlaybackParams(true)
+        .setEnableDecoderFallback(true)
 
     val player = ExoPlayer.Builder(context, renderersFactory)
         .setTrackSelector(trackSelector)

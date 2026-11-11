@@ -43,7 +43,9 @@ internal abstract class AfterglowDatabase : RoomDatabase() {
 }
 
 internal class Store(context: Context) {
-    private val database = Room.databaseBuilder(context, AfterglowDatabase::class.java, "afterglow.db").build()
+    private val database = Room.databaseBuilder(context, AfterglowDatabase::class.java, "afterglow.db")
+        .setJournalMode(RoomDatabase.JournalMode.WRITE_AHEAD_LOGGING)
+        .build()
     private val records = database.records()
     private val key: SecretKey by lazy {
         val alias = "afterglow-local-v1"

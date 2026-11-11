@@ -8,6 +8,7 @@
         android:banner="@drawable/tv_banner"
         android:icon="@drawable/app_icon"
         android:label="DASH"
+        android:largeHeap="true"
         android:theme="@style/Theme.Afterglow"
         android:usesCleartextTraffic="true">
         <activity

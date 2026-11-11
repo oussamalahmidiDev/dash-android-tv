@@ -149,15 +149,21 @@ private val xmlTime = DateTimeFormatter.ofPattern("uuuuMMddHHmmss")
 private val xmlZone = Regex("[+-]\\d{4}")
 
 internal fun xmlTimestamp(value: String?): Long? {
-    val parts = value?.trim()?.split(Regex("\\s+")) ?: return null
-    val clock = parts.firstOrNull() ?: return null
-    if (clock.length !in setOf(12, 14)) return null
-    val zone = parts.getOrNull(1)
-    if (zone != null && !xmlZone.matches(zone) && zone !in listOf("Z", "UTC", "GMT")) return null
-    return runCatching {
-        val offset = if (zone != null && xmlZone.matches(zone)) ZoneOffset.of(zone) else ZoneOffset.UTC
-        LocalDateTime.parse(clock.padEnd(14, '0'), xmlTime).toInstant(offset).toEpochMilli()
-    }.getOrNull()
+    if (value == null) return null
+    val trimmed = value.trim()
+    val spaceIdx = trimmed.indexOf(' ')
+    val clock = if (spaceIdx >= 0) trimmed.substring(0, spaceIdx) else trimmed
+    val len = clock.length
+    if (len != 12 && len != 14) return null
+    val zoneStr = if (spaceIdx >= 0) trimmed.substring(spaceIdx).trim() else null
+    if (zoneStr != null && zoneStr != "Z" && zoneStr != "UTC" && zoneStr != "GMT" && !xmlZone.matches(zoneStr)) return null
+    return try {
+        val offset = if (zoneStr != null && xmlZone.matches(zoneStr)) ZoneOffset.of(zoneStr) else ZoneOffset.UTC
+        val padded = if (len == 12) clock + "00" else clock
+        LocalDateTime.parse(padded, xmlTime).toInstant(offset).toEpochMilli()
+    } catch (_: Exception) {
+        null
+    }
 }
 
 internal fun parseXmltv(

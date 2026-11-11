@@ -70,6 +70,8 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import coil.ImageLoader
 import coil.compose.AsyncImage
+import coil.disk.DiskCache
+import coil.memory.MemoryCache
 import coil.request.CachePolicy
 import coil.request.ImageRequest
 
@@ -297,7 +299,7 @@ internal fun Artwork(url: String, allowHttp: Boolean, modifier: Modifier = Modif
     val safe = remember(url, allowHttp) { url.httpUrl()?.takeIf { allowHttp || it.isHttps } }
     val loader = remember(context, allowHttp) { ArtworkLoaders.get(context, allowHttp) }
     if (safe != null) AsyncImage(
-        remember(safe) { ImageRequest.Builder(context).data(safe.toString()).diskCachePolicy(CachePolicy.DISABLED).build() },
+        remember(safe) { ImageRequest.Builder(context).data(safe.toString()).crossfade(true).build() },
         contentDescription = null, imageLoader = loader, contentScale = scale, alignment = alignment,
         modifier = modifier, colorFilter = colorFilter, onSuccess = { onLoaded?.invoke() }
     )
@@ -307,13 +309,28 @@ private object ArtworkLoaders {
     private val loaders = mutableMapOf<Boolean, ImageLoader>()
 
     fun get(context: Context, http: Boolean) = loaders.getOrPut(http) {
-        ImageLoader.Builder(context.applicationContext).okHttpClient { Network.client(http) }
-            .diskCachePolicy(CachePolicy.DISABLED).build()
+        val app = context.applicationContext
+        ImageLoader.Builder(app)
+            .okHttpClient { Network.client(http) }
+            .diskCache {
+                DiskCache.Builder()
+                    .directory(app.cacheDir.resolve("image_cache"))
+                    .maxSizeBytes(64L * 1024 * 1024)
+                    .build()
+            }
+            .memoryCache {
+                MemoryCache.Builder(app)
+                    .maxSizePercent(0.20)
+                    .build()
+            }
+            .crossfade(true)
+            .build()
     }
 }
 
 @Composable
 internal fun Prism(modifier: Modifier = Modifier, accent: Color = Glacier) {
+    val bandPath = remember { Path() }
     Canvas(modifier) {
         val w = size.width
         val h = size.height
@@ -322,14 +339,13 @@ internal fun Prism(modifier: Modifier = Modifier, accent: Color = Glacier) {
         for (index in 0..3) {
             val x = w * (.39f + index * .155f)
             val tip = x + w * .32f
-            val band = Path().apply {
-                moveTo(x - w * .11f, h)
-                lineTo(x + w * .03f, 0f)
-                lineTo(tip, 0f)
-                lineTo(tip - w * .22f, h)
-                close()
-            }
-            drawPath(band, Brush.linearGradient(
+            bandPath.rewind()
+            bandPath.moveTo(x - w * .11f, h)
+            bandPath.lineTo(x + w * .03f, 0f)
+            bandPath.lineTo(tip, 0f)
+            bandPath.lineTo(tip - w * .22f, h)
+            bandPath.close()
+            drawPath(bandPath, Brush.linearGradient(
                 listOf(accent.copy(alpha = .03f), accent.copy(alpha = .22f - index * .03f), Ink.copy(alpha = .22f)),
                 start = Offset(x, h * .89f), end = Offset(tip, h * .19f)
             ))

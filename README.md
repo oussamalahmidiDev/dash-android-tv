@@ -6,13 +6,13 @@ DASH is a native Android TV and Google TV app for Android 8.0 or later. It bring
 
 [Browse published DASH releases](https://github.com/oussamalahmidiDev/dash-android-tv/releases).
 
-**With a USB drive.** Copy `DASH-2.0.6.apk` to a USB drive. Open it from a file manager on the TV, allow that file manager to install apps if Android prompts you, and select **Install**. DASH appears in the TV app launcher.
+**With a USB drive.** Copy `DASH-2.0.7.apk` to a USB drive. Open it from a file manager on the TV, allow that file manager to install apps if Android prompts you, and select **Install**. DASH appears in the TV app launcher.
 
 **With ADB.** Enable debugging on the TV and connect it to your computer with the option your TV offers. For a TV with **Wireless debugging**, pair and connect using the addresses shown on the TV. The pairing and connection ports can be different. [Android Debug Bridge setup](https://developer.android.com/tools/adb)
 
 ```sh
 adb devices
-adb install -r DASH-2.0.6.apk
+adb install -r DASH-2.0.7.apk
 ```
 
 To upgrade from an earlier DASH or Afterglow version, install the signed DASH APK over the existing installation. The package ID and signing key carry over, so your playlists, add-ons, favorites, and playback progress stay in place.
@@ -26,7 +26,7 @@ DASH 1.4.0 adds Cinemeta automatically on first launch, including after an upgra
 1. In **Settings → IPTV**, enter your **M3U playlist URL** and optionally your **XMLTV guide URL**. A gzip-compressed guide is accepted. Select **Import playlist**. Choose **HTTP allowed** first if your provider’s feed or stream uses HTTP.
 2. Classify each imported group as **Live TV**, **Movies**, **Series**, or **Hidden**. Groups start as Live TV. DASH groups titles such as `Harbor S01E02` into seasons and leaves other entries in a Series group playable on their own. The guide matches the playlist’s `tvg-id` to the XMLTV channel ID.
 3. In **Settings → Stremio add-ons**, enter a compatible add-on’s `manifest.json` URL and select **Install**. Add-on catalog support varies. **Search** includes installed catalogs that advertise search and titles already in the local library.
-4. If you want torrent playback, enable it under **Settings → Advanced**. The TV can upload pieces to peers during playback. DASH keeps up to 256 MiB of torrent media and metadata in its cache and reuses those bytes when you reopen the same source.
+4. If you want torrent playback, enable it under **Settings → Advanced**. The TV can upload pieces to peers during playback. DASH keeps up to 400 MiB of torrent media and metadata in its cache and reuses those bytes when you reopen the same source.
 
 To play a Cinemeta movie or episode, open its source picker and add a compatible Stremio stream add-on using its manifest URL. Return to the source picker to see what the add-on offers. If you select a torrent with peer-to-peer playback disabled, DASH opens the relevant setting and returns to the same title when you go back.
 

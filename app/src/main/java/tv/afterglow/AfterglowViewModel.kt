@@ -290,15 +290,19 @@ internal class AfterglowViewModel(application: Application) : AndroidViewModel(a
         if (term == previousTerm) return
 
         searchJob?.cancel()
-        results = emptyList()
-        searching = term.isNotEmpty()
-        if (!searching) return
+        if (term.isEmpty()) {
+            results = emptyList()
+            searching = false
+            return
+        }
+        searching = true
         searchJob = viewModelScope.launch {
             try {
+                delay(180)
                 val cached = library.searchCached(local, shelves, term)
                 results = cached
                 if (addons.any { addon -> addon.catalogs.any(Catalog::search) }) {
-                    delay(300)
+                    delay(200)
                     val found = library.searchAddons(addons, term)
                     results = (cached + found).distinctBy(Title::key)
                 }
