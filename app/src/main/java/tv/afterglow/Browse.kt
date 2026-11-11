@@ -1,5 +1,6 @@
 package tv.afterglow
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.runtime.remember
@@ -14,12 +15,16 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -63,15 +68,17 @@ internal fun browseShelves(addons: List<Shelf>, local: List<Title>): List<Shelf>
 internal fun BrowseScreen(model: AfterglowViewModel, shelves: List<Shelf>, kind: Kind?) {
     val available = shelves.filter { kind == null || it.kind == kind }
     val featured = remember(available, kind) { featuredTitles(available, kind) }
-    val progress = model.progress.filter { kind == null || it.title.kind == kind }
+    val progress = model.continueWatching.filter { kind == null || it.title.kind == kind }
     val favorites = model.favorites.filter { it.kind in VideoKinds && (kind == null || kind == it.kind) }
-    val recent = remember(kind, model.recentChannels, model.local) {
-        if (kind != null || model.recentChannels.isEmpty()) emptyList()
+    val favoriteChannels = remember(kind, model.favorites, model.local) {
+        if (kind != null) emptyList()
         else {
-            val byId = model.local.titles.asSequence().filter { it.kind == Kind.LIVE }.associateBy(Title::id)
-            model.recentChannels.mapNotNull(byId::get)
+            val keys = model.favorites.asSequence().filter { it.kind == Kind.LIVE }.map(Title::key).toSet()
+            model.local.titles.filter { it.kind == Kind.LIVE && it.key in keys }
         }
     }
+    var removal by remember { mutableStateOf<String?>(null) }
+    var returnFocus by remember { mutableStateOf<String?>(null) }
 
     BoxWithConstraints(Modifier.fillMaxSize().background(BrowseBackground)) {
         val landscapeWidth = (maxWidth * .222f).coerceAtLeast(150.dp)
@@ -104,8 +111,20 @@ internal fun BrowseScreen(model: AfterglowViewModel, shelves: List<Shelf>, kind:
             if (progress.isNotEmpty()) item("continue") {
                 BrowseShelf("Continue Watching", "continue", onOpen = { model.openCatalog(continueCatalog(kind)) }) {
                     ShelfStrip(gap) {
-                        itemsIndexed(progress.take(30), key = { _, resume -> resume.key }) { index, resume ->
-                            ContinueCard(resume, landscapeWidth, featured.isEmpty() && index == 0) { model.open(resume.title, resume) }
+                        itemsIndexed(progress.take(30), key = { _, resume -> resume.title.key }) { index, resume ->
+                            val titleKey = resume.title.key
+                            ContinueCard(resume, landscapeWidth, featured.isEmpty() && index == 0,
+                                confirming = removal == titleKey, restoreFocus = returnFocus == titleKey,
+                                onFocusRestored = { returnFocus = null },
+                                onRequestRemove = { removal = titleKey },
+                                onCancel = { removal = null; returnFocus = titleKey },
+                                onRemove = {
+                                    returnFocus = (progress.getOrNull(index + 1)?.takeIf { index < 29 }
+                                        ?: progress.getOrNull(index - 1))?.title?.key
+                                    removal = null
+                                    model.removeFromContinueWatching(resume.title)
+                                },
+                                open = { model.open(resume.title) })
                         }
                     }
                 }
@@ -120,12 +139,14 @@ internal fun BrowseScreen(model: AfterglowViewModel, shelves: List<Shelf>, kind:
                     }
                 }
             }
-            if (recent.isNotEmpty()) item("recent-channels") {
-                BrowseShelf("Recently Watched Channels", "recent-channels", icon = TvGlyph.CLOCK) {
+            if (favoriteChannels.isNotEmpty()) item("favorite-channels") {
+                BrowseShelf("Favorite Channels", "favorite-channels", icon = TvGlyph.STAR) {
                     ShelfStrip(gap) {
-                        itemsIndexed(recent, key = { _, channel -> channel.key }) { index, channel ->
-                            ChannelCard(channel, "recent/${channel.key}", landscapeWidth * .86f,
-                                preferred = featured.isEmpty() && progress.isEmpty() && favorites.isEmpty() && index == 0) { model.open(channel) }
+                        itemsIndexed(favoriteChannels, key = { _, channel -> channel.key }) { index, channel ->
+                            val favorite = FavoriteAction(true) { model.toggleFavorite(channel) }
+                            ChannelCard(channel, "favorite-channels/${channel.key}", landscapeWidth * .86f,
+                                preferred = featured.isEmpty() && progress.isEmpty() && favorites.isEmpty() && index == 0,
+                                favorite = favorite) { model.open(channel) }
                         }
                     }
                 }
@@ -137,13 +158,13 @@ internal fun BrowseScreen(model: AfterglowViewModel, shelves: List<Shelf>, kind:
                         itemsIndexed(shelf.titles.take(24), key = { _, title -> title.key }) { index, title ->
                             PortraitCard(title, "${shelf.id}/${title.key}", portraitWidth,
                                 if (ranked) index + 1 else null,
-                                featured.isEmpty() && progress.isEmpty() && favorites.isEmpty() && recent.isEmpty() && shelfIndex == 0 && index == 0
+                                featured.isEmpty() && progress.isEmpty() && favorites.isEmpty() && favoriteChannels.isEmpty() && shelfIndex == 0 && index == 0
                             ) { model.open(title) }
                         }
                     }
                 }
             }
-            if (progress.isEmpty() && recent.isEmpty() && available.isEmpty() && favorites.isEmpty()) item("empty") {
+            if (progress.isEmpty() && favoriteChannels.isEmpty() && available.isEmpty() && favorites.isEmpty()) item("empty") {
                 EmptyPanel(
                     kind?.label ?: "Your library",
                     when {
@@ -213,10 +234,52 @@ internal fun PortraitCard(
 }
 
 @Composable
-private fun ContinueCard(resume: Resume, width: Dp, preferred: Boolean, open: () -> Unit) {
+private fun ContinueCard(
+    resume: Resume, width: Dp, preferred: Boolean, confirming: Boolean, restoreFocus: Boolean,
+    onFocusRestored: () -> Unit, onRequestRemove: () -> Unit, onCancel: () -> Unit,
+    onRemove: () -> Unit, open: () -> Unit
+) {
     val title = resume.title
-    ArtworkCard(title, title.backdrop.ifBlank { title.poster }, "continue/${resume.key}",
-        width, width * .70f, preferred, open) {
+    val requester = remember { FocusRequester() }
+    val height = width * .70f
+    LaunchedEffect(restoreFocus, confirming) {
+        if (restoreFocus && !confirming) {
+            withFrameNanos { }
+            if (requester.tryFocus()) onFocusRestored()
+        }
+    }
+    if (confirming) {
+        BackHandler(onBack = onCancel)
+        val memory = remember { FocusMemory() }
+        val confirmRequester = remember { FocusRequester() }
+        LaunchedEffect(Unit) {
+            confirmRequester.tryFocus()
+        }
+        FocusScope(memory, "continue/confirm/${title.key}", entry = confirmRequester) {
+            Column(
+                Modifier.size(width, height).background(Slate, RoundedCornerShape(14.dp))
+                    .border(1.dp, CardBorder, RoundedCornerShape(14.dp))
+                    .padding(horizontal = 14.dp, vertical = 12.dp).focusGroup(),
+                verticalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    "Remove from Continue Watching?", color = Porcelain, fontSize = 13.sp,
+                    lineHeight = 17.sp, fontWeight = FontWeight.SemiBold
+                )
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    ContinueConfirmButton("Keep", true, onCancel)
+                    ContinueConfirmButton("Remove", false, onRemove)
+                }
+            }
+        }
+        return
+    }
+    ArtworkCard(title, title.backdrop.ifBlank { title.poster }, "continue/${title.key}",
+        width, height, preferred, open, modifier = Modifier.focusRequester(requester),
+        onLongClick = onRequestRemove, onLongClickLabel = "Remove from Continue Watching") {
         Column(Modifier.align(Alignment.BottomStart).fillMaxWidth().padding(horizontal = 12.dp, vertical = 11.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(title.name, color = Porcelain, fontSize = 16.sp, lineHeight = 18.sp, fontWeight = FontWeight.Bold,
@@ -237,17 +300,36 @@ private fun ContinueCard(resume: Resume, width: Dp, preferred: Boolean, open: ()
 }
 
 @Composable
+private fun ContinueConfirmButton(label: String, preferred: Boolean, onClick: () -> Unit) {
+    RemoteButton("continue/confirm/$label", preferred = preferred, radius = 10, onClick = onClick) { focused ->
+        Text(
+            label,
+            Modifier
+                .background(if (focused) Porcelain else Ink, RoundedCornerShape(10.dp))
+                .padding(horizontal = 14.dp, vertical = 7.dp),
+            color = if (focused) Ink else Porcelain,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.SemiBold
+        )
+    }
+}
+
+@Composable
 private fun ArtworkCard(
     title: Title, artwork: String, id: String, width: Dp, height: Dp, preferred: Boolean, open: () -> Unit,
     modifier: Modifier = Modifier, focusIcon: TvGlyph? = null, favorite: FavoriteAction? = null,
+    onLongClick: (() -> Unit)? = favorite?.toggle, onLongClickLabel: String? = favorite?.label,
     content: @Composable BoxScope.() -> Unit
 ) {
     RemoteButton("artwork/$id", modifier.size(width, height).favoriteState(favorite), preferred, radius = 14,
-        onLongClick = favorite?.toggle, onLongClickLabel = favorite?.label, onClick = open) { focused ->
+        onLongClick = onLongClick, onLongClickLabel = onLongClickLabel, onClick = open) { focused ->
         val shape = RoundedCornerShape(14.dp)
         Box(Modifier.fillMaxSize().border(1.dp, CardBorder, shape)) {
             Prism(Modifier.fillMaxSize(), if (title.kind == Kind.SERIES) Color(0xFFABBCFC) else Glacier)
-            Artwork(artwork, title.allowHttp, Modifier.fillMaxSize())
+            Artwork(artwork, title.allowHttp,
+                if (title.kind == Kind.LIVE) Modifier.align(Alignment.TopCenter).padding(8.dp).fillMaxSize(.63f)
+                else Modifier.fillMaxSize(),
+                if (title.kind == Kind.LIVE) ContentScale.Fit else ContentScale.Crop)
             Box(Modifier.fillMaxSize().background(Brush.verticalGradient(
                 0f to Color.Black.copy(alpha = .32f), .30f to Color.Transparent,
                 .58f to Color.Transparent, 1f to Color.Black.copy(alpha = .9f)
@@ -304,19 +386,20 @@ internal fun ContinueScreen(progress: List<Resume>, model: AfterglowViewModel) {
         itemsIndexed(progress, key = { _, resume -> resume.key }) { _, resume ->
             val title = resume.title
             ListItem("continue/list/${resume.key}", title.name, resumeCaption(resume),
-                title.poster, title.allowHttp) { model.open(title, resume) }
+                title.poster, title.allowHttp) { model.open(title) }
         }
     }
 }
 
 private fun resumeCaption(resume: Resume): String {
+    if (resume.title.kind == Kind.LIVE) return "Live TV"
     val episode = resume.episode
     val episodeLabel = if (episode?.season != null && episode.number != null) "S${episode.season}, E${episode.number}"
         else episode?.name
     val total = resume.duration?.takeIf { it > 0 }
     val minutes = ((total?.let { (it - resume.position).coerceAtLeast(0) } ?: resume.position) / 60_000)
     val time = when {
-        minutes < 1 -> if (total == null) "Just started" else "<1m left"
+        minutes < 1 -> "Just started"
         minutes < 60 -> "${minutes}m"
         else -> "${minutes / 60}h ${minutes % 60}m"
     }

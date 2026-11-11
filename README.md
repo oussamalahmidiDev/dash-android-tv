@@ -6,33 +6,33 @@ DASH is a native Android TV and Google TV app for Android 8.0 or later. It bring
 
 [Browse published DASH releases](https://github.com/oussamalahmidiDev/dash-android-tv/releases).
 
-**With a USB drive.** Copy `DASH-2.0.4.apk` to a USB drive. Open it from a file manager on the TV, allow that file manager to install apps if Android prompts you, and select **Install**. DASH appears in the TV app launcher.
+**With a USB drive.** Copy `DASH-2.0.6.apk` to a USB drive. Open it from a file manager on the TV, allow that file manager to install apps if Android prompts you, and select **Install**. DASH appears in the TV app launcher.
 
 **With ADB.** Enable debugging on the TV and connect it to your computer with the option your TV offers. For a TV with **Wireless debugging**, pair and connect using the addresses shown on the TV. The pairing and connection ports can be different. [Android Debug Bridge setup](https://developer.android.com/tools/adb)
 
 ```sh
 adb devices
-adb install -r DASH-2.0.4.apk
+adb install -r DASH-2.0.6.apk
 ```
 
 To upgrade from an earlier DASH or Afterglow version, install the signed DASH APK over the existing installation. The package ID and signing key carry over, so your playlists, add-ons, favorites, and playback progress stay in place.
 
 ## Add sources
 
-On a fresh install, DASH opens a welcome screen with Cinemeta and optional IPTV.org and Torrentio presets. Choose the presets you want to install. Torrent playback has a separate opt-in under **Settings → Playback**. Existing DASH installations keep their sources and skip the welcome screen.
+On a fresh install, DASH opens a welcome screen with Cinemeta and optional IPTV.org and Torrentio presets. Choose the presets you want to install. Torrent playback has a separate opt-in under **Settings → Advanced**. Existing DASH installations keep their sources and skip the welcome screen.
 
 DASH 1.4.0 adds Cinemeta automatically on first launch, including after an upgrade. Cinemeta provides movie and series catalogs, search, and title information. Playback requires a separate streaming source. You can remove Cinemeta in **Settings → Stremio add-ons**, and DASH will remember that choice. [Cinemeta manifest](https://v3-cinemeta.strem.io/manifest.json)
 
 1. In **Settings → IPTV**, enter your **M3U playlist URL** and optionally your **XMLTV guide URL**. A gzip-compressed guide is accepted. Select **Import playlist**. Choose **HTTP allowed** first if your provider’s feed or stream uses HTTP.
 2. Classify each imported group as **Live TV**, **Movies**, **Series**, or **Hidden**. Groups start as Live TV. DASH groups titles such as `Harbor S01E02` into seasons and leaves other entries in a Series group playable on their own. The guide matches the playlist’s `tvg-id` to the XMLTV channel ID.
 3. In **Settings → Stremio add-ons**, enter a compatible add-on’s `manifest.json` URL and select **Install**. Add-on catalog support varies. **Search** includes installed catalogs that advertise search and titles already in the local library.
-4. If you want torrent playback, enable it under **Settings → Playback**. The TV can upload pieces to peers during playback. Torrent playback uses temporary internal storage and ends when you close the mini-player or leave DASH.
+4. If you want torrent playback, enable it under **Settings → Advanced**. The TV can upload pieces to peers during playback. DASH keeps up to 256 MiB of torrent media and metadata in its cache and reuses those bytes when you reopen the same source.
 
 To play a Cinemeta movie or episode, open its source picker and add a compatible Stremio stream add-on using its manifest URL. Return to the source picker to see what the add-on offers. If you select a torrent with peer-to-peer playback disabled, DASH opens the relevant setting and returns to the same title when you go back.
 
 For an imported playlist, switching **HTTP allowed** or **HTTPS only** takes effect immediately. The source status panel shows progress and the result of add-on installs, playlist imports, and refreshes. Use **Refresh** under IPTV to update the playlist and guide. If either feed fails, DASH keeps the last successfully imported lineup and schedule. Live TV can tune a channel with no guide match. On-demand progress and favorites stay on the TV.
 
-To start over, open **Settings → Playback → Reset DASH** and confirm. Android clears DASH’s app data and cache. Open the app again to run setup.
+To start over, open **Settings → Advanced → Reset DASH** and confirm. Android clears DASH’s app data and cache. Open the app again to run setup.
 
 ## Build from source
 
@@ -53,11 +53,11 @@ The release APK is written to `app/build/outputs/apk/release/`. Android requires
 
 ## Dashboard and player
 
-Home, Movies, and Series open with a featured carousel. Use the previous and next buttons to browse it, or select View details. Home also groups Continue Watching, Recently Watched Channels, ranked shelves, and source catalogs. Shelf numbers follow the imported catalog order. Press Down on a main tab or a Settings section to enter it. A live channel appears after playback starts, and the history stays on the device. In Search, select the search bar and type. Matches appear as you type in grids for movies, series, and live channels. Press Back to dismiss the keyboard, then use the D-pad to move through the grid. Press Select to open a title or tune a channel. Hold Select on a result to add it to favorites or remove it again.
+Home, Movies, and Series open with a featured carousel. Use the previous and next buttons to browse it, or select View details. Home includes Continue Watching, Favorites, Favorite Channels, ranked shelves, and source catalogs. Shelf numbers follow the imported catalog order. Press Down on a main tab or a Settings section to enter it. Channels appear in Continue Watching after playback starts. Hold Select on a Continue Watching card to remove it. Series show the last watched episode, and videos with under a minute left leave the shelf. In Search, select the search bar and type. Matches appear as you type. Use All, Movies, Series, or Channels to filter them. Press Back to dismiss the keyboard, then use the D-pad to move through the grid. Press Select to open a title or tune a channel. Hold Select on a result to add it to favorites or remove it again.
 
 Movie and series details open on a large backdrop with viewing and favorite actions. Scroll down on a series page to select a season or episode.
 
-In the player, the arrow icons seek and the center icon plays or pauses. Select the speaker icon to adjust DASH’s playback volume. Audio tracks and subtitles have separate controls. Press Back to dismiss an open panel.
+In the player, the pale section of the timeline shows buffered video. Live channels with a seekable window have a 30-second rewind control. Use the remote volume keys to adjust media volume. Audio tracks and subtitles have separate controls. Press Back to dismiss an open panel.
 
 Press Back during playback to return to browsing. Live TV keeps playing in the mini-player, while a movie or episode pauses and keeps its buffer. Select **Return to playback** to reopen it, or close the mini-player to stop playback.
 

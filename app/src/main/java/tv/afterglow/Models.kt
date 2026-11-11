@@ -84,7 +84,7 @@ internal data class Source(
     val magnet: String? = null, val fileIndex: Int? = null,
     val mime: String? = null, val subtitles: List<Subtitle> = emptyList(),
     val allowHttp: Boolean = false, val headers: Map<String, String> = emptyMap(),
-    val description: String = ""
+    val description: String = "", val seeds: Int? = null
 )
 
 @Serializable
@@ -95,10 +95,23 @@ internal data class Shelf(val id: String, val name: String, val kind: Kind, val 
 internal data class Resume(
     val title: Title, val episode: Episode?, val position: Long, val updated: Long,
     val duration: Long? = null, val source: Source? = null,
-    val subtitleUrl: String? = null, val subtitleLanguage: String? = null, val subtitleDelayMs: Long = 0L
+    val subtitleUrl: String? = null, val subtitleLanguage: String? = null, val subtitleDelayMs: Long = 0L,
+    val ended: Boolean = false
 ) {
     val key get() = playbackKey(title, episode)
+    val canResume get() = !ended && position >= 1_000L &&
+        (duration == null || duration <= 0 || duration - position >= 60_000L)
 }
+
+@Serializable
+internal data class RecentChannel(val id: String, val updated: Long)
+
+internal fun latestResumes(progress: List<Resume>): List<Resume> = progress.asSequence()
+    .filter { it.ended || it.position >= 1_000L }
+    .sortedByDescending(Resume::updated)
+    .distinctBy { it.title.key }
+    .filter(Resume::canResume)
+    .toList()
 
 internal data class PlayRequest(val title: Title, val episode: Episode?, val source: Source,
                                 val resume: Long, val token: Long = System.nanoTime())

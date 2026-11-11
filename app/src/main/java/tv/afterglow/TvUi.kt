@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ProvideTextStyle
 import androidx.compose.material3.Text
@@ -49,6 +50,8 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.progressBarRangeInfo
+import androidx.compose.ui.semantics.ProgressBarRangeInfo
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
@@ -179,12 +182,15 @@ internal fun RemoteButton(
     val ownRequester = remember { FocusRequester() }
     val requester = area?.entry?.takeIf { preferred } ?: ownRequester
     var focused by remember { mutableStateOf(false) }
+    var keyPressStartedHere by remember { mutableStateOf(false) }
     val lift by animateFloatAsState(if (focused) 1f else 0f, tween(155), label = "remote focus")
     val shape = RoundedCornerShape(radius.dp)
     LaunchedEffect(area?.scope, id, enabled) {
         if (enabled && area != null && (area.target == id || (area.target == null && preferred))) {
-            withFrameNanos { }
-            requester.requestFocus()
+            if (!requester.tryFocus()) {
+                withFrameNanos { }
+                requester.tryFocus()
+            }
         }
     }
     Box(
@@ -192,7 +198,36 @@ internal fun RemoteButton(
             .focusRequester(requester)
             .onFocusChanged {
                 focused = it.isFocused
+                if (!focused) keyPressStartedHere = false
                 if (focused) area?.memory?.set(area.scope, id)
+            }
+            .onPreviewKeyEvent { event ->
+                val code = event.nativeKeyEvent.keyCode
+                val isSelect = code == KeyEvent.KEYCODE_DPAD_CENTER ||
+                               code == KeyEvent.KEYCODE_ENTER ||
+                               code == KeyEvent.KEYCODE_NUMPAD_ENTER
+                if (!isSelect) return@onPreviewKeyEvent false
+                when (event.type) {
+                    KeyEventType.KeyDown -> {
+                        if (event.nativeKeyEvent.repeatCount == 0) {
+                            keyPressStartedHere = true
+                            false
+                        } else if (!keyPressStartedHere) {
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    KeyEventType.KeyUp -> {
+                        if (!keyPressStartedHere) {
+                            true
+                        } else {
+                            keyPressStartedHere = false
+                            false
+                        }
+                    }
+                    else -> false
+                }
             }
             .graphicsLayer {
                 scaleX = 1f + .04f * lift
@@ -225,6 +260,19 @@ internal fun Action(
         ) {
             Glyph(icon, tint, Modifier.size(17.dp))
             Text(text, color = tint, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, lineHeight = 18.sp)
+        }
+    }
+}
+
+@Composable
+internal fun LoadingIndicator(progress: Float?, modifier: Modifier = Modifier) {
+    if (progress == null) {
+        CircularProgressIndicator(modifier, color = Glacier, strokeWidth = 2.dp)
+    } else {
+        val fraction = progress.coerceIn(0f, 1f)
+        Canvas(modifier.semantics { progressBarRangeInfo = ProgressBarRangeInfo(fraction, 0f..1f) }) {
+            drawCircle(Slate)
+            drawArc(Glacier, -90f, fraction * 360f, useCenter = true)
         }
     }
 }
@@ -338,7 +386,7 @@ private fun TvApp(model: AfterglowViewModel) {
                     saved.SaveableStateProvider(scope) {
                         FocusScope(memory, scope) {
                             if (catalog != null) CatalogScreen(catalog, model)
-                            else ContinueScreen(model.progress.filter { resumeCatalog == null || it.title.kind == resumeCatalog }, model)
+                            else ContinueScreen(model.continueWatching.filter { resumeCatalog == null || it.title.kind == resumeCatalog }, model)
                         }
                     }
                 }

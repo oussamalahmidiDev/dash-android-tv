@@ -19,6 +19,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRestorer
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Brush
@@ -367,12 +368,15 @@ internal fun SettingsScreen(
             }
             if (returnToSources == null && section == SettingsSection.PLAYBACK) item("reset") {
                 Spacer(Modifier.height(12.dp))
-                Heading("App data", size = 20)
-                Action("Reset DASH", TvGlyph.TRASH, "settings/reset", enabled = !model.busy) {
-                    resetFailed = false
-                    confirmReset = true
+                Column(verticalArrangement = Arrangement.spacedBy(9.dp)) {
+                    Heading("App Data", size = 20)
+                    Muted("Clear DASH data on this device and start setup again.")
+                    Action("Reset DASH", TvGlyph.TRASH, "settings/reset", enabled = !model.busy) {
+                        resetFailed = false
+                        confirmReset = true
+                    }
+                    if (resetFailed) Muted("Android couldn’t clear DASH data.")
                 }
-                if (resetFailed) Muted("Android couldn’t clear DASH data.")
             }
         }
         if (confirmReset) {
@@ -449,13 +453,14 @@ internal fun DetailScreen(detail: Details, model: AfterglowViewModel) {
     val favorite = model.favorites.any { it.key == title.key }
     val seasons = remember(title.episodes) { title.episodes.groupBy(Episode::season) }
     val firstEpisodeFocus = remember { FocusRequester() }
+    val activeSeasonFocus = remember { FocusRequester() }
     var season by rememberSaveable(title.key) { mutableStateOf<Int?>(null) }
     val activeSeason = when {
         season == -1 && null in seasons -> null
         season != null && season in seasons -> season
         else -> seasons.keys.firstOrNull { it != null && it > 0 } ?: seasons.keys.firstOrNull()
     }
-    val resume = model.progress.firstOrNull { it.title.key == title.key }
+    val resume = model.continueWatching.firstOrNull { it.title.key == title.key }
     val first = title.episodes.firstOrNull { (it.season ?: 1) > 0 } ?: title.episodes.firstOrNull()
     val action = when {
         resume != null -> "Resume"
@@ -536,34 +541,40 @@ internal fun DetailScreen(detail: Details, model: AfterglowViewModel) {
                 }
             }
             if (series) {
-                item("season-controls") {
-                    if (seasons.isEmpty()) {
-                        Column(Modifier.padding(horizontal = BrowseRail, vertical = 12.dp)) {
-                            Heading("Episodes", size = 21)
-                            Muted(if (detail.loading) "Loading episodes…" else "This add-on hasn’t supplied episodes.")
-                        }
-                    } else if (seasons.size == 1) {
-                        Heading(seasonLabel(activeSeason), Modifier.padding(start = BrowseRail, top = 12.dp), size = 22)
-                    } else {
-                        LazyRow(Modifier.focusGroup(), contentPadding = PaddingValues(horizontal = BrowseRail, vertical = 9.dp),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            items(seasons.keys.toList(), key = { it ?: -1 }) { number ->
-                                Box(Modifier.onRemoteDown { firstEpisodeFocus.tryFocus() }) {
-                                    Action(seasonLabel(number), TvGlyph.SERIES, "detail/season/$number",
-                                        primary = number == activeSeason) { season = number ?: -1 }
+                item("seasons-and-episodes") {
+                    Column {
+                        if (seasons.isEmpty()) {
+                            Column(Modifier.padding(horizontal = BrowseRail, vertical = 12.dp)) {
+                                Heading("Episodes", size = 21)
+                                Muted(if (detail.loading) "Loading episodes…" else "This add-on hasn’t supplied episodes.")
+                            }
+                        } else if (seasons.size == 1) {
+                            Heading(seasonLabel(activeSeason), Modifier.padding(start = BrowseRail, top = 12.dp), size = 22)
+                        } else {
+                            LazyRow(Modifier.focusGroup(), contentPadding = PaddingValues(horizontal = BrowseRail, vertical = 9.dp),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                items(seasons.keys.toList(), key = { it ?: -1 }) { number ->
+                                    val entry = if (number == activeSeason) Modifier.focusRequester(activeSeasonFocus) else Modifier
+                                    Box(entry.onRemoteDown { firstEpisodeFocus.tryFocus() }) {
+                                        Action(seasonLabel(number), TvGlyph.SERIES, "detail/season/$number",
+                                            primary = number == activeSeason) { season = number ?: -1 }
+                                    }
                                 }
                             }
                         }
-                    }
-                }
-                val episodes = seasons[activeSeason].orEmpty()
-                if (episodes.isNotEmpty()) item("episode-strip") {
-                    ShelfStrip(14.dp) {
-                        items(episodes, key = Episode::id) { episode ->
-                            val entry = if (episode.id == episodes.first().id) Modifier.focusRequester(firstEpisodeFocus) else Modifier
-                            EpisodeCard(title, episode, episodeWidth,
-                                model.progress.any { it.key == playbackKey(title, episode) }, entry) {
-                                model.pickSources(episode)
+                        val episodes = seasons[activeSeason].orEmpty()
+                        if (episodes.isNotEmpty()) key(activeSeason) {
+                            ShelfStrip(14.dp) {
+                                items(episodes, key = Episode::id) { episode ->
+                                    val entry = if (episode.id == episodes.first().id) {
+                                        Modifier.focusRequester(firstEpisodeFocus)
+                                    } else Modifier
+                                    EpisodeCard(title, episode, episodeWidth,
+                                        model.getResume(title, episode)?.canResume == true,
+                                        entry.focusProperties { if (seasons.size > 1) up = activeSeasonFocus }) {
+                                        model.pickSources(episode)
+                                    }
+                                }
                             }
                         }
                     }
@@ -585,21 +596,21 @@ private fun EpisodeCard(
     modifier: Modifier = Modifier, open: () -> Unit
 ) {
     RemoteButton("detail/episode/${episode.id}", modifier.width(width), radius = 13, onClick = open) {
-        Column {
-            Box(Modifier.fillMaxWidth().aspectRatio(16f / 9)) {
-                Prism(Modifier.matchParentSize())
-                Artwork(episode.thumbnail.ifBlank { title.backdrop }, title.allowHttp, Modifier.matchParentSize())
-                Box(Modifier.align(Alignment.BottomEnd).padding(9.dp)
-                    .background(Ink.copy(alpha = .72f), RoundedCornerShape(12.dp)).padding(6.dp)) {
-                    Glyph(TvGlyph.PLAY, Porcelain, Modifier.size(14.dp))
+        Box(Modifier.fillMaxWidth().aspectRatio(16f / 9)) {
+            Prism(Modifier.matchParentSize())
+            Artwork(episode.thumbnail.ifBlank { title.backdrop }, title.allowHttp, Modifier.matchParentSize())
+            Box(Modifier.matchParentSize().background(Brush.verticalGradient(
+                0f to Color.Transparent, .34f to Color.Transparent, 1f to Ink.copy(alpha = .97f)
+            )))
+            Row(Modifier.align(Alignment.BottomStart).fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    val label = episode.number?.let { "$it. ${episode.name}" } ?: episode.name
+                    Text(label, color = Porcelain, fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
+                        maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    if (resume) Muted("Resume", size = 11, maxLines = 1)
                 }
-            }
-            Column(Modifier.fillMaxWidth().background(Slate).padding(horizontal = 10.dp, vertical = 8.dp),
-                verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                val label = episode.number?.let { "$it. ${episode.name}" } ?: episode.name
-                Text(label, color = Porcelain, fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
-                    maxLines = 1, overflow = TextOverflow.Ellipsis)
-                if (resume) Muted("Resume", size = 11, maxLines = 1)
+                Glyph(TvGlyph.PLAY, Porcelain, Modifier.size(14.dp))
             }
         }
     }
@@ -609,6 +620,7 @@ private fun EpisodeCard(
 private fun SourcePicker(detail: Details, model: AfterglowViewModel) {
     val title = detail.title
     val sourceId = detail.episode?.id ?: title.id
+    var inspectedSource by remember { mutableStateOf<Source?>(null) }
     val hasStreamAddon = model.addons.any { it.supports("stream", title.kind.stremioType(), sourceId) }
     BoxWithConstraints(Modifier.fillMaxSize().background(Ink)) {
         val columns = if (maxWidth >= 900.dp) 3 else 2
@@ -624,8 +636,13 @@ private fun SourcePicker(detail: Details, model: AfterglowViewModel) {
             }
             item("source-heading") {
                 Heading(detail.episode?.name?.let { "Sources for $it" } ?: "Choose a source")
-                if (detail.findingSources) Muted(if (detail.sources.isEmpty()) "Finding streams…" else "Looking for more sources…")
-                else if (detail.sources.isEmpty()) {
+                if (detail.findingSources) {
+                    Row(Modifier.padding(top = 4.dp), verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        LoadingIndicator(detail.sourceProgress, Modifier.size(17.dp))
+                        Muted(if (detail.sources.isEmpty()) "Finding streams…" else "Looking for more sources…")
+                    }
+                } else if (detail.sources.isEmpty()) {
                     Muted(detail.error ?: when {
                         title.iptv -> "This playlist entry is no longer available."
                         hasStreamAddon -> "Your streaming add-ons returned no playable streams for this title."
@@ -649,6 +666,7 @@ private fun SourcePicker(detail: Details, model: AfterglowViewModel) {
                                 source = source,
                                 p2p = model.p2p,
                                 preferred = index == 0,
+                                onInspect = { inspectedSource = source },
                                 onClick = { model.selectSource(source) }
                             )
                         }
@@ -674,18 +692,20 @@ private fun SourcePicker(detail: Details, model: AfterglowViewModel) {
                 }
             }
         }
+        inspectedSource?.let { SourceDetails(it) { inspectedSource = null } }
     }
 }
 
 @Composable
 private fun SourceGridCard(
     id: String, source: Source, p2p: Boolean, preferred: Boolean = false,
-    onClick: () -> Unit
+    onInspect: () -> Unit, onClick: () -> Unit
 ) {
     val transport = if (source.url != null) "Direct" else if (p2p) "Torrent" else "Torrent off"
     val disabledTorrent = source.url == null && !p2p
     val description = source.description.trim()
-    RemoteButton(id, Modifier.fillMaxWidth(), preferred = preferred, radius = 14, onClick = onClick) { focused ->
+    RemoteButton(id, Modifier.fillMaxWidth(), preferred = preferred, radius = 14,
+        onLongClick = onInspect, onLongClickLabel = "Source details", onClick = onClick) { focused ->
         val tint = if (focused) Ink else Porcelain
         val mutedTint = if (focused) Ink.copy(alpha = 0.72f) else Fog
         Column(
@@ -700,9 +720,11 @@ private fun SourceGridCard(
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
                 Row(
+                    Modifier.weight(1f),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
+                    SourceHealthDot(source, focused)
                     Box(
                         Modifier.background(
                             if (focused) Ink.copy(alpha = 0.12f) else Glacier.copy(alpha = 0.20f),

@@ -171,7 +171,8 @@ internal class Stremio {
             val label = item.str("name").lineSequence().map(String::trim).filter(String::isNotEmpty).joinToString(" · ")
             Source(addon.name, label.ifBlank { if (url != null) "Direct stream" else "Torrent" },
                 url?.toString(), magnet, item.number("fileIdx"), url?.let(::guessMime), subtitles,
-                addon.allowHttp, headers, description = item.str("description").ifBlank { item.str("title") })
+                addon.allowHttp, headers, description = item.str("description").ifBlank { item.str("title") },
+                seeds = item.number("seeders") ?: item.number("seeds"))
         }.distinctBy { Triple(it.url, it.magnet, it.fileIndex) }
     }
 

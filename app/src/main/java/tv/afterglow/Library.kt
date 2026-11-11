@@ -20,11 +20,12 @@ internal data class LocalLibrary(
     val titles by lazy { playlist?.let { playlistTitles(it, entries) }.orEmpty() }
     val entryIndex by lazy { entries.associateBy(FeedEntry::id) }
     val schedule by lazy { guide.groupBy(Program::channel) }
+    val channelIndex by lazy { titles.asSequence().filter { it.kind == Kind.LIVE }.associateBy(Title::id) }
 }
 
 internal data class SavedLibrary(
     val local: LocalLibrary, val addons: List<Addon>, val shelves: List<Shelf>,
-    val favorites: List<Title>, val progress: List<Resume>, val p2p: Boolean, val recentChannels: List<String>
+    val favorites: List<Title>, val progress: List<Resume>, val p2p: Boolean, val recentChannels: List<RecentChannel>
 )
 
 internal class Library(context: Context) {
@@ -51,10 +52,15 @@ internal class Library(context: Context) {
         local.titles
         local.entryIndex
         local.schedule
+        local.channelIndex
+        val recents = store.load<List<RecentChannel>>("recent-channel-history")
+            ?: store.load<List<String>>("recent-channels").orEmpty().mapIndexed { index, id ->
+                RecentChannel(id, -index.toLong())
+            }
         SavedLibrary(local, restoreAddons(), store.load("shelves") ?: emptyList(),
             store.list("favorite/").map { json.decodeFromString<Title>(it) },
             store.list("progress/").map { json.decodeFromString<Resume>(it) }.sortedByDescending(Resume::updated),
-            store.load("p2p") ?: false, store.load("recent-channels") ?: emptyList())
+            store.load("p2p") ?: false, recents)
     }
 
     private suspend fun restoreAddons(): List<Addon> {
@@ -176,21 +182,21 @@ internal class Library(context: Context) {
 
     suspend fun sources(
         addons: List<Addon>, local: LocalLibrary, title: Title, episode: Episode?,
-        onBatch: (suspend (List<Source>) -> Unit)? = null
+        onBatch: (suspend (List<Source>, Int) -> Unit)? = null
     ): List<Source> = io {
         val id = episode?.id ?: title.id
         if (title.iptv) {
             val entry = local.entryIndex[id.removePrefix("iptv:")] ?: return@io emptyList()
             val sources = listOf(Source("IPTV", entry.title, url = entry.url, mime = entry.mime,
                 allowHttp = local.playlist?.allowHttp == true))
-            onBatch?.invoke(sources)
+            onBatch?.invoke(sources, 1)
             return@io sources
         }
         val type = title.kind.stremioType()
         val matches = addons.filter { it.supports("stream", type, id) }
         val responses = parallel(matches) { addon ->
             val streams = attempt { stremio.streams(addon, type, id) }
-            if (!streams.isNullOrEmpty()) onBatch?.invoke(streams)
+            onBatch?.invoke(streams.orEmpty(), matches.size)
             streams
         }
         if (responses.isNotEmpty() && responses.all { it == null }) {
@@ -221,8 +227,12 @@ internal class Library(context: Context) {
         store.change("progress/${digest(key)}" to resume?.let { json.encodeToString(it) })
     }
 
-    suspend fun recentChannels(ids: List<String>) = io {
-        store.change("recent-channels" to json.encodeToString(ids))
+    suspend fun clearProgress(keys: List<String>) = io {
+        store.change(*keys.map { "progress/${digest(it)}" to null }.toTypedArray())
+    }
+
+    suspend fun recentChannels(channels: List<RecentChannel>) = io {
+        store.change("recent-channel-history" to json.encodeToString(channels), "recent-channels" to null)
     }
 
     suspend fun p2p(enabled: Boolean) = io { store.change("p2p" to json.encodeToString(enabled)) }

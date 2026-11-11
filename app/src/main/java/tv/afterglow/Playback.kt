@@ -63,6 +63,7 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.Timeline
 import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.common.TrackSelectionParameters
 import androidx.media3.common.Tracks
@@ -326,12 +327,7 @@ internal fun PlaybackScreen(
                             Spacer(Modifier.height(4.dp))
                             Action("Try again", TvGlyph.RETRY, "player/prepare/retry", preferred = true, primary = true) { retry++ }
                         } else {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(46.dp),
-                                color = Glacier,
-                                strokeWidth = 3.dp
-                            )
-                            Loading()
+                            Loading(showSpinner = true)
                         }
                     }
                 }
@@ -357,7 +353,7 @@ private fun Video(
     val latestStarted by rememberUpdatedState(onStarted)
     val live = request.title.kind == Kind.LIVE
     val player = remember(prepared) {
-        makePlayer(context, prepared, initialPosition.takeUnless { live } ?: 0L)
+        makePlayer(context, prepared, initialPosition.takeUnless { live } ?: C.TIME_UNSET)
     }
     var videoSize by remember(player) { mutableStateOf(VideoSize.UNKNOWN) }
     val quality = when {
@@ -375,6 +371,10 @@ private fun Video(
     var tracks by remember { mutableStateOf(Tracks.EMPTY) }
     var position by remember { mutableLongStateOf(0L) }
     var duration by remember { mutableLongStateOf(C.TIME_UNSET) }
+    var bufferedPosition by remember { mutableLongStateOf(0L) }
+    var bufferedDuration by remember { mutableLongStateOf(0L) }
+    var seekable by remember { mutableStateOf(false) }
+    var rebuffering by remember { mutableStateOf(false) }
     var visible by remember { mutableStateOf(true) }
     var activity by remember { mutableIntStateOf(0) }
     var trackType by remember { mutableStateOf<Int?>(null) }
@@ -389,7 +389,13 @@ private fun Video(
     var timelineFocused by remember { mutableStateOf(false) }
     var focusTimeline by remember { mutableStateOf(false) }
     var seekPreview by remember(player) { mutableStateOf<Long?>(null) }
-    val canSeek = !live && duration > 0 && player.isCurrentMediaItemSeekable
+    val canSeek = !live && duration > 0 && seekable
+    val canRewindLive = live && (seekable || player.isCurrentMediaItemSeekable)
+    val bufferingProgress = if (live || duration <= 0) null else {
+        val remaining = (duration - position).coerceAtLeast(1L)
+        val target = minOf(remaining, if (rebuffering) RebufferMs.toLong() else InitialBufferMs.toLong())
+        (bufferedDuration.toFloat() / target).coerceIn(0f, 1f)
+    }
     val overlayMemory = remember { FocusMemory() }
     val audioFocus = remember { FocusRequester() }
     val subtitleFocus = remember { FocusRequester() }
@@ -508,6 +514,16 @@ private fun Video(
     }
 
     fun showControls() { visible = true; activity++ }
+    fun rewind() {
+        if (live) {
+            if (player.isCurrentMediaItemSeekable) {
+                val target = liveRewindTarget(player.currentPosition)
+                player.seekTo(target)
+                position = target
+            }
+        } else player.seekBack()
+        showControls()
+    }
     fun previewSeek(delta: Long) {
         val base = seekPreview ?: player.currentPosition
         seekPreview = (base + delta).coerceIn(0L, duration)
@@ -570,6 +586,9 @@ private fun Video(
             }
 
             override fun onPlaybackStateChanged(playbackState: Int) {
+                if (playbackState == Player.STATE_BUFFERING) {
+                    rebuffering = stage == Player.STATE_READY && player.playWhenReady
+                }
                 stage = playbackState
                 val stateName = when (playbackState) {
                     Player.STATE_IDLE -> "IDLE"
@@ -595,6 +614,12 @@ private fun Video(
                 showControls()
             }
 
+            override fun onTimelineChanged(timeline: Timeline, reason: Int) {
+                seekable = player.isCurrentMediaItemSeekable
+                duration = player.duration
+                position = player.currentPosition
+            }
+
             override fun onTracksChanged(updated: Tracks) { tracks = updated }
             override fun onVideoSizeChanged(size: VideoSize) { videoSize = size }
         }
@@ -609,11 +634,17 @@ private fun Video(
     }
 
     LaunchedEffect(player, minimized) {
-        var lastSaved = 0L
+        var lastSaved: Long? = null
         while (true) {
             position = player.currentPosition
             duration = player.duration
-            if (!live && playing && kotlin.math.abs(position - lastSaved) >= 15_000L) {
+            bufferedPosition = player.bufferedPosition
+            bufferedDuration = player.totalBufferedDuration
+            seekable = player.isCurrentMediaItemSeekable
+            val saved = lastSaved
+            if (!live && playing && position >= 1_000L &&
+                (saved == null || kotlin.math.abs(position - saved) >= 15_000L ||
+                    duration > 0 && duration - position < 60_000L && duration - saved >= 60_000L)) {
                 latestRecord(position, duration, false)
                 lastSaved = position
             }
@@ -666,13 +697,16 @@ private fun Video(
             AndroidKeyEvent.KEYCODE_MEDIA_PLAY -> { player.play(); showControls(); true }
             AndroidKeyEvent.KEYCODE_MEDIA_PAUSE -> { player.pause(); showControls(); true }
             AndroidKeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> { if (!live) player.seekForward(); showControls(); true }
-            AndroidKeyEvent.KEYCODE_MEDIA_REWIND -> { if (!live) player.seekBack(); showControls(); true }
+            AndroidKeyEvent.KEYCODE_MEDIA_REWIND -> { rewind(); true }
             AndroidKeyEvent.KEYCODE_DPAD_CENTER, AndroidKeyEvent.KEYCODE_ENTER -> {
                 if (!visible) { toggle(); true } else { activity++; false }
             }
             AndroidKeyEvent.KEYCODE_DPAD_LEFT, AndroidKeyEvent.KEYCODE_DPAD_RIGHT -> {
                 val wasHidden = !visible
-                if (canSeek && error == null && trackType == null && (wasHidden || timelineFocused || focusTimeline)) {
+                if (wasHidden && canRewindLive && error == null && code == AndroidKeyEvent.KEYCODE_DPAD_LEFT) {
+                    rewind()
+                    true
+                } else if (canSeek && error == null && trackType == null && (wasHidden || timelineFocused || focusTimeline)) {
                     val step = if (key.nativeKeyEvent.repeatCount >= 4) 60_000L else 10_000L
                     if (wasHidden) focusTimeline = true
                     previewSeek(if (code == AndroidKeyEvent.KEYCODE_DPAD_LEFT) -step else step)
@@ -753,7 +787,7 @@ private fun Video(
 
         if (minimized) {
             MiniPlayerControls(playbackTitle(request), error != null, expand, exit)
-            if (stage == Player.STATE_BUFFERING && error == null) Loading(Modifier.align(Alignment.Center))
+            if (stage == Player.STATE_BUFFERING && error == null) Loading(Modifier.align(Alignment.Center), bufferingProgress)
             return@Box
         }
         if (!visible) Box(Modifier.size(1.dp).focusRequester(hiddenFocus).focusable())
@@ -809,6 +843,8 @@ private fun Video(
                                 Muted(time(displayedPosition), size = 12)
                                 Box(Modifier.weight(1f).height(if (timelineFocused) 7.dp else 4.dp)
                                     .background(Fog.copy(alpha = .36f), RoundedCornerShape(2.dp))) {
+                                    Box(Modifier.fillMaxWidth((bufferedPosition.toDouble() / duration).coerceIn(0.0, 1.0).toFloat())
+                                        .fillMaxHeight().background(Porcelain.copy(alpha = .43f), RoundedCornerShape(2.dp)))
                                     Box(Modifier.fillMaxWidth((displayedPosition.toDouble() / duration).coerceIn(0.0, 1.0).toFloat())
                                         .fillMaxHeight().background(if (timelineFocused) Porcelain else Fog, RoundedCornerShape(2.dp)))
                                 }
@@ -831,11 +867,9 @@ private fun Video(
                                 horizontalArrangement = Arrangement.spacedBy(13.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                if (!live) {
-                                    IconAction(TvGlyph.REWIND, "Back 10 seconds", "video/seek-back") {
-                                        player.seekBack()
-                                        showControls()
-                                    }
+                                if (!live || canRewindLive) {
+                                    IconAction(TvGlyph.REWIND, if (live) "Back 30 seconds" else "Back 10 seconds",
+                                        "video/seek-back", onClick = ::rewind)
                                 }
                                 IconAction(if (shouldPause) TvGlyph.PAUSE else TvGlyph.PLAY,
                                     if (shouldPause) "Pause" else "Play", "video/play",
@@ -884,7 +918,7 @@ private fun Video(
             }
         }
         if (stage == Player.STATE_BUFFERING && activeError == null && trackType == null && !showSourcePicker && !showSubtitlePicker) {
-            Loading(Modifier.align(Alignment.Center))
+            Loading(Modifier.align(Alignment.Center), bufferingProgress, showSpinner = true)
         }
         if (showSubtitlePicker) {
             Box(Modifier.align(Alignment.BottomEnd).padding(end = Rail, bottom = 111.dp)) {
@@ -951,9 +985,14 @@ private fun Video(
 }
 
 @Composable
-private fun Loading(modifier: Modifier = Modifier) {
-    Muted("Loading...", modifier.background(Color.Black.copy(alpha = .65f), RoundedCornerShape(8.dp))
-        .padding(horizontal = 13.dp, vertical = 7.dp))
+private fun Loading(modifier: Modifier = Modifier, progress: Float? = null, showSpinner: Boolean = false) {
+    Column(modifier.background(Color.Black.copy(alpha = .65f), RoundedCornerShape(12.dp))
+        .padding(horizontal = 13.dp, vertical = 8.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(7.dp)) {
+        if (progress != null || showSpinner) LoadingIndicator(progress, Modifier.size(26.dp))
+        Muted("Loading…", size = 13)
+    }
 }
 
 @Composable
@@ -1354,12 +1393,6 @@ private fun playbackTitle(request: PlayRequest): String {
     return listOf(number, episode.name).filter(String::isNotBlank).joinToString("  ·  ")
 }
 
-private val qualityPattern = Regex("""\b(4k|2160p|1440p|1080p|720p|480p|360p)\b""", RegexOption.IGNORE_CASE)
-private fun sourceQuality(source: Source): String? {
-    val value = qualityPattern.find(source.label + " " + source.description)?.value?.lowercase(Locale.ROOT)
-    return if (value == "2160p" || value == "4k") "4K" else value
-}
-
 @Composable
 private fun BoxScope.MiniPlayerControls(title: String, failed: Boolean, expand: () -> Unit, close: () -> Unit) {
     Row(Modifier.align(Alignment.TopEnd).padding(8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -1375,16 +1408,23 @@ private fun BoxScope.MiniPlayerControls(title: String, failed: Boolean, expand: 
     }
 }
 
+private const val InitialBufferMs = 1_000
+private const val RebufferMs = 2_000
+internal const val LiveRewindMs = 30_000L
+
+internal fun liveRewindTarget(currentPosition: Long, rewindAmountMs: Long = LiveRewindMs): Long =
+    (currentPosition - rewindAmountMs).coerceAtLeast(0L)
+
 private fun makePlayer(context: Context, media: Prepared, position: Long): ExoPlayer {
     val loadControl = DefaultLoadControl.Builder()
         .setBufferDurationsMs(
             /* minBufferMs = */ 15_000,
             /* maxBufferMs = */ 50_000,
-            /* bufferForPlaybackMs = */ 1_000,
-            /* bufferForPlaybackAfterRebufferMs = */ 2_000
+            /* bufferForPlaybackMs = */ InitialBufferMs,
+            /* bufferForPlaybackAfterRebufferMs = */ RebufferMs
         )
         .setPrioritizeTimeOverSizeThresholds(true)
-        .setBackBuffer(10_000, false)
+        .setBackBuffer(LiveRewindMs.toInt(), true)
         .build()
 
     val trackSelector = DefaultTrackSelector(context).apply {
@@ -1493,6 +1533,7 @@ private fun SourceFloatingPicker(
     sources: List<Source>, currentSource: Source, loading: Boolean, p2p: Boolean,
     onSelect: (Source) -> Unit, close: () -> Unit
 ) {
+    var inspectedSource by remember { mutableStateOf<Source?>(null) }
     val shape = RoundedCornerShape(15.dp)
     val selectedIndex = sources.indexOfFirst {
         it.provider == currentSource.provider && it.label == currentSource.label
@@ -1538,7 +1579,9 @@ private fun SourceFloatingPicker(
                         },
                         preferred = index == selectedIndex,
                         radius = 8,
-                        onClick = { onSelect(s) }
+                        onLongClick = { inspectedSource = s },
+                        onLongClickLabel = "Source details",
+                        onClick = { if (s.url != null || p2p) onSelect(s) else inspectedSource = s }
                     ) { focused ->
                         val tint = if (focused) Ink else Porcelain
                         val mutedTint = if (focused) Ink.copy(alpha = 0.70f) else Fog
@@ -1553,6 +1596,7 @@ private fun SourceFloatingPicker(
                                 if (isSelected && !focused) Porcelain else tint,
                                 Modifier.size(16.dp)
                             )
+                            SourceHealthDot(s, focused)
                             Column(Modifier.weight(1f)) {
                                 Text(
                                     s.label, color = tint, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
@@ -1567,6 +1611,7 @@ private fun SourceFloatingPicker(
             }
         }
     }
+    inspectedSource?.let { SourceDetails(it) { inspectedSource = null } }
 }
 
 private fun playerError(error: PlaybackException, torrent: Boolean): String = when (error.errorCode) {

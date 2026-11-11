@@ -2,6 +2,7 @@ package tv.afterglow
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
+import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -15,6 +16,7 @@ import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
@@ -23,6 +25,7 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -35,6 +38,9 @@ import kotlinx.coroutines.launch
 
 private val SearchKinds = listOf(Kind.MOVIE, Kind.SERIES, Kind.LIVE)
 
+internal fun shouldShowSearchFilterTabs(query: String, hasResults: Boolean): Boolean =
+    query.isNotBlank() && hasResults
+
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 internal fun SearchScreen(model: AfterglowViewModel) {
@@ -44,14 +50,24 @@ internal fun SearchScreen(model: AfterglowViewModel) {
     val field = rememberEditorFocus(editing)
     val editor = remember { FocusRequester() }
     val firstResult = remember { FocusRequester() }
+    val filters = remember { List(SearchKinds.size + 1) { FocusRequester() } }
+    var filter by rememberSaveable { mutableIntStateOf(0) }
+    val visibleKinds = SearchKinds.getOrNull(filter - 1)?.let(::listOf) ?: SearchKinds
     val grid = rememberLazyListState()
     val keyboard = LocalSoftwareKeyboardController.current
     val imeVisible = WindowInsets.isImeVisible
-    val results = remember(model.results) { model.results.groupBy(Title::kind) }
-    val firstKind = SearchKinds.firstOrNull(results::containsKey)
+    val hasResults = shouldShowSearchFilterTabs(model.query, model.results.isNotEmpty())
+    val results = remember(model.results, filter) {
+        model.results.filter { it.kind in visibleKinds }.groupBy(Title::kind)
+    }
+    val firstKind = visibleKinds.firstOrNull(results::containsKey)
     val favorites = remember(model.favorites) { model.favorites.mapTo(hashSetOf(), Title::key) }
     val feedback = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
+
+    LaunchedEffect(model.query) {
+        if (model.query.isBlank()) filter = 0
+    }
 
     LaunchedEffect(editing) {
         if (editing) {
@@ -101,7 +117,8 @@ internal fun SearchScreen(model: AfterglowViewModel) {
                     RemoteButton(
                         "search/input", Modifier.weight(1f).focusRequester(field)
                             .focusProperties {
-                                if (firstKind != null && grid.firstVisibleItemIndex == 0) down = firstResult
+                                if (hasResults) down = filters[filter]
+                                else if (firstKind != null) down = firstResult
                             }
                             .semantics {
                                 contentDescription = if (model.query.isBlank()) "Search your library"
@@ -132,6 +149,29 @@ internal fun SearchScreen(model: AfterglowViewModel) {
                     }
                 }
             }
+            if (hasResults) {
+                Row(Modifier.padding(start = BrowseRail, end = BrowseRail, top = 8.dp).focusGroup(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf("All", "Movies", "Series", "Channels").forEachIndexed { index, label ->
+                        val selectedFilter = filter == index
+                        RemoteButton("search/filter/$index", Modifier.focusRequester(filters[index])
+                            .focusProperties {
+                                up = if (editing) editor else field
+                                if (firstKind != null && grid.firstVisibleItemIndex == 0) down = firstResult
+                            }.semantics { selected = selectedFilter }, radius = 18, onClick = {
+                                if (filter != index) {
+                                    filter = index
+                                    grid.requestScrollToItem(0)
+                                }
+                            }) { focused ->
+                            Text(label, Modifier.background(if (focused || selectedFilter) Porcelain else Slate)
+                                .padding(horizontal = 12.dp, vertical = 6.dp),
+                                color = if (focused || selectedFilter) Ink else Fog,
+                                fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+                }
+            }
             LazyColumn(
                 modifier = Modifier.weight(1f), state = grid,
                 contentPadding = PaddingValues(start = BrowseRail, end = BrowseRail, top = gap, bottom = 56.dp),
@@ -159,7 +199,7 @@ internal fun SearchScreen(model: AfterglowViewModel) {
                 }
                 model.notice?.let { message -> item("notice") { Muted(message) } }
 
-                for (kind in SearchKinds) {
+                for (kind in visibleKinds) {
                     val matches = results[kind].orEmpty()
                     if (matches.isEmpty()) continue
                     val minWidth = if (kind == Kind.LIVE) 142.dp else 104.dp
@@ -175,7 +215,9 @@ internal fun SearchScreen(model: AfterglowViewModel) {
                         Row(horizontalArrangement = Arrangement.spacedBy(gap)) {
                             for ((column, title) in row.withIndex()) key(title.key) {
                                 val focus = if (kind == firstKind && index == 0 && column == 0)
-                                    Modifier.focusRequester(firstResult) else Modifier
+                                    Modifier.focusRequester(firstResult).focusProperties {
+                                        up = if (hasResults) filters[filter] else if (editing) editor else field
+                                    } else Modifier
                                 val favorite = FavoriteAction(title.key in favorites) {
                                     model.toggleFavorite(title) { added ->
                                         feedback.currentSnackbarData?.dismiss()

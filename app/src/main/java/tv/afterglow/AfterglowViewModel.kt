@@ -1,6 +1,7 @@
 package tv.afterglow
 
 import android.app.Application
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -23,7 +24,7 @@ internal enum class Tab(val title: String) {
 }
 
 internal enum class SettingsSection(val label: String) {
-    IPTV("IPTV"), ADDONS("Stremio add-ons"), PLAYBACK("Playback")
+    IPTV("IPTV"), ADDONS("Stremio add-ons"), PLAYBACK("Advanced")
 }
 internal enum class StatusPhase { WORKING, SUCCESS, ERROR }
 internal data class SettingsStatus(val section: SettingsSection, val message: String, val phase: StatusPhase)
@@ -31,7 +32,7 @@ internal data class SettingsStatus(val section: SettingsSection, val message: St
 internal data class Details(
     val title: Title, val loading: Boolean = true, val episode: Episode? = null,
     val showSources: Boolean = false, val findingSources: Boolean = false,
-    val sources: List<Source> = emptyList(), val error: String? = null
+    val sources: List<Source> = emptyList(), val error: String? = null, val sourceProgress: Float? = null
 )
 
 internal class AfterglowViewModel(application: Application) : AndroidViewModel(application) {
@@ -42,6 +43,7 @@ internal class AfterglowViewModel(application: Application) : AndroidViewModel(a
     private var sourceJob: Job? = null
     private var searchJob: Job? = null
     private var playerSourceJob: Job? = null
+    private var dismissedPlaybackToken: Long? = null
 
     var ready by mutableStateOf(false); private set
     var busy by mutableStateOf(false); private set
@@ -54,8 +56,8 @@ internal class AfterglowViewModel(application: Application) : AndroidViewModel(a
     var loadingCinemeta by mutableStateOf(false); private set
     var shelves by mutableStateOf(emptyList<Shelf>()); private set
     var favorites by mutableStateOf(emptyList<Title>()); private set
-    var progress by mutableStateOf(emptyList<Resume>()); private set
-    var recentChannels by mutableStateOf(emptyList<String>()); private set
+    private var progress by mutableStateOf(emptyList<Resume>())
+    private var recentChannels by mutableStateOf(emptyList<RecentChannel>())
     var p2p by mutableStateOf(false); private set
     var tab by mutableStateOf(Tab.HOME); private set
     var details by mutableStateOf<Details?>(null); private set
@@ -306,22 +308,47 @@ internal class AfterglowViewModel(application: Application) : AndroidViewModel(a
         }
     }
 
-    fun markChannelWatched(request: PlayRequest) {
-        if (request.title.kind != Kind.LIVE || playback?.token != request.token) return
-        val id = request.title.id
-        val updated = (listOf(id) + recentChannels.filterNot { it == id }).take(20)
-        if (updated == recentChannels) return
-        recentChannels = updated
+    val continueWatching by derivedStateOf {
+        val channels = recentChannels.mapNotNull { recent ->
+            local.channelIndex[recent.id]?.let { Resume(it, null, 0L, recent.updated) }
+        }
+        (latestResumes(progress) + channels).sortedByDescending(Resume::updated)
+    }
+
+    fun removeFromContinueWatching(title: Title) {
+        playback?.takeIf { it.title.key == title.key }?.let { dismissedPlaybackToken = it.token }
+        if (title.kind == Kind.LIVE) {
+            recentChannels = recentChannels.filterNot { it.id == title.id }
+            saveRecentChannels()
+        } else {
+            val keys = progress.filter { it.title.key == title.key }.map(Resume::key)
+            progress = progress.filterNot { it.title.key == title.key }
+            viewModelScope.launch {
+                progressWrites.withLock { attempt { library.clearProgress(keys) } }
+            }
+        }
+    }
+
+    private fun saveRecentChannels() {
         viewModelScope.launch {
             recentWrites.withLock { attempt { library.recentChannels(recentChannels) } }
         }
+    }
+
+    fun markChannelWatched(request: PlayRequest) {
+        if (request.title.kind != Kind.LIVE || playback?.token != request.token ||
+            dismissedPlaybackToken == request.token) return
+        val id = request.title.id
+        val watched = RecentChannel(id, System.currentTimeMillis())
+        recentChannels = (listOf(watched) + recentChannels.filterNot { it.id == id }).take(20)
+        saveRecentChannels()
     }
 
     suspend fun featuredDetails(title: Title): Title = attempt { library.detail(addons, title) } ?: title
 
     var targetResumePosition by mutableStateOf<Long?>(null); private set
 
-    fun open(title: Title, resume: Resume? = null) {
+    fun open(title: Title) {
         if (title.kind == Kind.LIVE) {
             val entry = local.entryIndex[title.id.removePrefix("iptv:")] ?: return
             start(title, null, Source("IPTV", entry.title, entry.url, mime = entry.mime,
@@ -343,12 +370,16 @@ internal class AfterglowViewModel(application: Application) : AndroidViewModel(a
         val title = details?.title ?: return
         sourceJob?.cancel()
         details = details?.copy(episode = episode, showSources = true, findingSources = true,
-            sources = emptyList(), error = null)
+            sources = emptyList(), error = null, sourceProgress = null)
         sourceJob = viewModelScope.launch {
             try {
-                library.sources(addons, local, title, episode) { batch ->
+                var completed = 0
+                library.sources(addons, local, title, episode) { batch, total ->
                     withContext(Dispatchers.Main) {
-                        details = details?.let { it.copy(sources = it.sources + batch) }
+                        completed++
+                        details = details?.let {
+                            it.copy(sources = it.sources + batch, sourceProgress = completed.toFloat() / total)
+                        }
                     }
                 }
                 details = details?.copy(findingSources = false)
@@ -407,6 +438,9 @@ internal class AfterglowViewModel(application: Application) : AndroidViewModel(a
     fun rememberSource(title: Title, episode: Episode?, source: Source) {
         val key = playbackKey(title, episode)
         lastChosenSources[key] = source
+        val current = playback
+        if (current != null && current.token == dismissedPlaybackToken &&
+            playbackKey(current.title, current.episode) == key) return
         val existing = progress.firstOrNull { it.key == key }
         val updated = if (existing != null) {
             existing.copy(source = source)
@@ -481,7 +515,7 @@ internal class AfterglowViewModel(application: Application) : AndroidViewModel(a
         }
         playerSourceJob?.cancel()
         playerMinimized = false
-        val pos = startPosition ?: (progress.firstOrNull { it.key == key }?.position ?: 0)
+        val pos = startPosition ?: (getResume(title, episode)?.takeIf(Resume::canResume)?.position ?: 0)
         playback = PlayRequest(title, episode, source, pos)
     }
 
@@ -526,18 +560,21 @@ internal class AfterglowViewModel(application: Application) : AndroidViewModel(a
         subtitleUrl: String? = null, subtitleLanguage: String? = null, subtitleDelayMs: Long? = null,
         clearSubtitle: Boolean = false
     ) {
-        if (request.title.kind == Kind.LIVE || (!ended && position < 1_000L)) return
+        if (request.title.kind == Kind.LIVE || dismissedPlaybackToken == request.token ||
+            (!ended && position < 1_000L)) return
         val key = playbackKey(request.title, request.episode)
-        val knownDuration = duration.takeIf { it > 0 } ?: progress.firstOrNull { it.key == key }?.duration
         val prev = progress.firstOrNull { it.key == key }
-        val item = if (ended) null else Resume(
+        val knownDuration = duration.takeIf { it > 0 } ?: prev?.duration
+        if (ended && prev?.ended == true) return
+        val item = Resume(
             request.title, request.episode, position, System.currentTimeMillis(), knownDuration,
             lastChosenSources[key] ?: request.source,
             subtitleUrl = if (clearSubtitle) null else (subtitleUrl ?: prev?.subtitleUrl),
             subtitleLanguage = if (clearSubtitle) null else (subtitleLanguage ?: prev?.subtitleLanguage),
-            subtitleDelayMs = subtitleDelayMs ?: prev?.subtitleDelayMs ?: 0L
+            subtitleDelayMs = subtitleDelayMs ?: prev?.subtitleDelayMs ?: 0L,
+            ended = ended
         )
-        progress = listOfNotNull(item) + progress.filterNot { it.key == key }
+        progress = listOf(item) + progress.filterNot { it.key == key }
         viewModelScope.launch {
             progressWrites.withLock { attempt { library.progress(key, item) } }
         }

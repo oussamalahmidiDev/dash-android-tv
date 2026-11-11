@@ -51,6 +51,9 @@ internal class TorrentEngine(context: Context, magnet: String) {
     } else magnet
     private val params = AddTorrentParams.parseMagnetUri(preparedMagnet)
     private val hash: InfoHash = params.getInfoHashes()
+    private val torrentKey = if (hash.hasV1()) hash.v1.toHex() else hash.v2.toHex()
+    private val savedMedia = TorrentCache(File(context.cacheDir, "torrent-media"))
+    private val metadataKey = "$torrentKey.metadata"
     private val root = File(context.cacheDir, "torrent-playback")
     private val cache: File
     private lateinit var handle: TorrentHandle
@@ -83,6 +86,15 @@ internal class TorrentEngine(context: Context, magnet: String) {
             }
             manager.start(SessionParams(settings).apply { setPosixDiskIO() })
             val native = params.swig()
+            val savedInfo = savedMedia.entry(metadataKey)?.let { saved ->
+                attempt { TorrentInfo(saved) }?.takeIf {
+                    if (hash.hasV1()) it.infoHashV1() == hash.v1 else it.infoHashV2() == hash.v2
+                } ?: run { saved.delete(); null }
+            }
+            if (savedInfo != null) {
+                native.set_ti(savedInfo.swig())
+                Log.d(TAG, "[METADATA_CACHE_HIT] Restored torrent metadata.")
+            }
             native.setSave_path(cache.absolutePath)
             native.setFlags(native.getFlags().and_(TorrentFlags.AUTO_MANAGED.inv())
                 .and_(TorrentFlags.PAUSED.inv()).or_(TorrentFlags.UPLOAD_MODE))
@@ -144,6 +156,12 @@ internal class TorrentEngine(context: Context, magnet: String) {
                     throw FeedError("This torrent contains no supported video files.")
                 }
                 Log.i(TAG, "[METADATA_FILES] Total files: ${info.numFiles()}, supported video files: ${videos.size}")
+                if (savedMedia.entry(metadataKey) == null) {
+                    attempt {
+                        val bytes = info.bencode()
+                        savedMedia.put(metadataKey, bytes.size.toLong()) { it.write(bytes) }
+                    }
+                }
                 return videos
             }
             delay(250)
@@ -169,21 +187,17 @@ internal class TorrentEngine(context: Context, magnet: String) {
         val files = info.files()
         val file = safeFile(files.filePath(video.index))
         val fileOffset = files.fileOffset(video.index)
-        val firstPiece = (fileOffset / pieceLength).toInt().coerceIn(0, numPieces - 1)
         val lastPiece = ((fileOffset + video.bytes - 1) / pieceLength).toInt().coerceIn(0, numPieces - 1)
         synchronized(lock) {
             checkOpen()
             windowPieces = ((8L * 1024 * 1024) / pieceLength).toInt().coerceIn(1, 16)
-            priorityPiece = firstPiece
-            windowEnd = minOf(firstPiece + windowPieces - 1, lastPiece)
-            // Set piece priorities once. Changing file priorities here would overwrite them asynchronously.
-            handle.prioritizePieces(Array(numPieces) {
-                if (it in firstPiece..windowEnd) Priority.SEVEN else Priority.IGNORE
-            })
-            handle.unsetFlags(TorrentFlags.UPLOAD_MODE)
-            scheduleDeadlines(firstPiece, firstPiece, windowEnd)
+            // Leave payload requests suspended until playback encounters a cache miss.
+            handle.prioritizePieces(Array(numPieces) { Priority.IGNORE })
         }
-        return DataSource.Factory { TorrentDataSource(this, file, video.bytes, fileOffset, pieceLength, lastPiece) }
+        return DataSource.Factory {
+            TorrentDataSource(this, savedMedia, "$torrentKey.${video.index}", file,
+                video.bytes, fileOffset, pieceLength, lastPiece)
+        }
     }
 
     private fun safeFile(path: String): File {
@@ -195,19 +209,23 @@ internal class TorrentEngine(context: Context, magnet: String) {
     }
 
     internal fun waitFor(piece: Int, last: Int, seek: Boolean) {
+        savedMedia.entry(metadataKey)
         synchronized(lock) {
             checkOpen()
-            if (priorityPiece != piece) {
-                val reset = seek || piece < priorityPiece || piece > priorityPiece + 1
+            if (priorityPiece != piece || seek) {
+                val firstRequest = priorityPiece < 0
+                val reset = firstRequest || seek || piece < priorityPiece || piece > priorityPiece + 1
                 val end = minOf(piece + windowPieces - 1, last)
                 if (reset) handle.clearPieceDeadlines()
                 val first = if (reset) piece else windowEnd + 1
                 for (next in first..end) {
                     if (!handle.havePiece(next)) handle.piecePriority(next, Priority.SEVEN)
                 }
-                for (old in priorityPiece..windowEnd) {
-                    if (old !in piece..end && !handle.havePiece(old)) handle.piecePriority(old, Priority.IGNORE)
-                }
+                if (!firstRequest) {
+                    for (old in priorityPiece..windowEnd) {
+                        if (old !in piece..end && !handle.havePiece(old)) handle.piecePriority(old, Priority.IGNORE)
+                    }
+                } else handle.unsetFlags(TorrentFlags.UPLOAD_MODE)
                 scheduleDeadlines(piece, first, end)
                 priorityPiece = piece
                 windowEnd = end
@@ -281,14 +299,18 @@ internal class TorrentEngine(context: Context, magnet: String) {
 }
 
 private class TorrentDataSource(
-    private val engine: TorrentEngine, private val file: File, private val size: Long,
-    private val offset: Long, private val pieceLength: Int, private val lastPiece: Int
+    private val engine: TorrentEngine, private val cache: TorrentCache, private val cacheKey: String,
+    private val file: File, private val size: Long, private val offset: Long,
+    private val pieceLength: Int, private val lastPiece: Int
 ) : BaseDataSource(true) {
     private var position = 0L
     private var remaining = 0L
     private var source: RandomAccessFile? = null
     private var uri: Uri? = null
     private var newRange = true
+    private var cachedInput: RandomAccessFile? = null
+    private var activePiece = -1
+    private var activePieceStart = 0L
 
     override fun open(dataSpec: DataSpec): Long {
         transferInitializing(dataSpec)
@@ -310,10 +332,26 @@ private class TorrentDataSource(
         val piece = (absolute / pieceLength).toInt()
         val withinPiece = (absolute % pieceLength).toInt()
         val count = minOf(length.toLong(), remaining, (pieceLength - withinPiece).toLong()).toInt()
-        engine.waitFor(piece, lastPiece, newRange)
-        newRange = false
-        val input = source ?: RandomAccessFile(file, "r").also { source = it }
-        input.seek(position)
+        if (activePiece != piece) {
+            cachedInput?.close()
+            cachedInput = null
+            activePieceStart = (piece.toLong() * pieceLength - this.offset).coerceAtLeast(0L)
+            val pieceEnd = ((piece.toLong() + 1) * pieceLength - this.offset).coerceAtMost(size)
+            val bytes = pieceEnd - activePieceStart
+            val key = "$cacheKey.$piece"
+            val cached = cache.entry(key, bytes)
+            cachedInput = cached?.let { attempt { RandomAccessFile(it, "r") } }
+            if (cachedInput == null) {
+                engine.waitFor(piece, lastPiece, newRange)
+                newRange = false
+                val input = source ?: RandomAccessFile(file, "r").also { source = it }
+                cache.putRange(key, input, activePieceStart, bytes)
+            }
+            activePiece = piece
+        }
+        val cached = cachedInput
+        val input = cached ?: checkNotNull(source)
+        input.seek(if (cached != null) position - activePieceStart else position)
         input.readFully(buffer, offset, count)
         position += count
         remaining -= count
@@ -324,8 +362,11 @@ private class TorrentDataSource(
     override fun getUri(): Uri? = uri
 
     override fun close() {
-        try { source?.close() }
-        finally {
+        try {
+            try { cachedInput?.close() } finally { source?.close() }
+        } finally {
+            cachedInput = null
+            activePiece = -1
             source = null
             if (uri != null) {
                 uri = null
